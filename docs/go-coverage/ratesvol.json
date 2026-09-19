@@ -606,6 +606,19 @@
       ]
     },
     {
+      "c": "itofin_swaption_vol_cube_new_with_backward_flat",
+      "configuration": "BackwardFlat selects backward-flat option-time interpolation on the SABR parameter cube; rejected for the interpolated cube",
+      "go": "SwaptionVolatilityCubeConfig.BackwardFlat",
+      "go_file": "sdk/go/volcube.go",
+      "python": "itofin.termstructures.SabrSwaptionVolatilityCube.__init__",
+      "rust_file": "crates/libitofin-ffi/src/volcube_api.rs",
+      "status": "implemented",
+      "tests": [
+        "crates/libitofin-ffi/src/vol_tests.rs::sabr_cube_backward_flat_boundary_matches_quantlib_oracle",
+        "sdk/go/vol_advanced_test.go::TestSABRCubeBackwardFlatQuantlibOracle"
+      ]
+    },
+    {
       "c": "itofin_swaption_vol_cube_atm",
       "go": "SwaptionVolatilityCube.ATMStrikeFromTenor",
       "go_file": "sdk/go/volcube.go",

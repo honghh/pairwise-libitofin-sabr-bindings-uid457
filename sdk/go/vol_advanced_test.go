@@ -1,7 +1,11 @@
 package itofin
 
 import (
+	"encoding/csv"
 	"math"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -135,6 +139,156 @@ func TestVolatilityCubeGoBufferOwnershipAndSABRLimit(t *testing.T) {
 		t.Fatal("closed cube queried")
 	}
 }
+
+// QuantLib 1.43 backward-flat oracle (crates/libitofin/tests/fixtures/sabr_backward_flat):
+// the CommonVars cube at 72 off-node samples x sparse/ATM-calibrated x flag
+// off/on, plus the config contract - BackwardFlat is SABR-only, and the
+// session keeps working after the interpolated cube rejects it.
+func TestSABRCubeBackwardFlatQuantlibOracle(t *testing.T) {
+	s, e := NewSession()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	ref := volDate(t, 15, 6, 2026)
+	settings, _ := s.NewSettings()
+	if e = settings.SetEvaluationDate(ref); e != nil {
+		t.Fatal(e)
+	}
+	dc, _ := s.Actual365Fixed()
+	curveDC, _ := s.Actual360()
+	fixedDC, _ := s.Thirty360BondBasis()
+	cal, _ := s.Target()
+	eur, _ := s.EUR()
+	curve, e := s.NewFlatForward(ref, .05, curveDC)
+	if e != nil {
+		t.Fatal(e)
+	}
+	ibor, e := s.NewEuriborSixMonths(curve, settings)
+	if e != nil {
+		t.Fatal(e)
+	}
+	ic := SwapIndexConfig{Family: "EuriborSwapIsdaFixA", Tenor: Period{2, Years}, FixedLegTenor: Period{1, Years}, SettlementDays: 2, Currency: eur, Calendar: cal, FixedLegConvention: ModifiedFollowing, FixedLegDayCounter: fixedDC, Index: ibor, Settings: settings}
+	index, e := s.NewSwapIndex(ic)
+	if e != nil {
+		t.Fatal(e)
+	}
+	ic.Tenor = Period{1, Years}
+	short, e := s.NewSwapIndex(ic)
+	if e != nil {
+		t.Fatal(e)
+	}
+	quoteRows := func(values [][]float64) [][]*SimpleQuote {
+		rows := make([][]*SimpleQuote, len(values))
+		for i, row := range values {
+			rows[i] = make([]*SimpleQuote, len(row))
+			for j, v := range row {
+				q, e := s.NewSimpleQuote(v)
+				if e != nil {
+					t.Fatal(e)
+				}
+				rows[i][j] = q
+			}
+		}
+		return rows
+	}
+	options := []Period{{1, Months}, {6, Months}, {1, Years}, {5, Years}, {10, Years}, {30, Years}}
+	swaps := []Period{{1, Years}, {5, Years}, {10, Years}, {30, Years}}
+	vols := [][]float64{{.1300, .1560, .1390, .1220}, {.1440, .1580, .1460, .1260}, {.1600, .1590, .1470, .1290}, {.1640, .1470, .1370, .1220}, {.1400, .1300, .1250, .1100}, {.1130, .1090, .1070, .0930}}
+	atm, e := s.SwaptionVolatilityMatrix(RateVolGridConfig{Calendar: cal, Convention: ModifiedFollowing, DayCounter: dc, Settings: settings, OptionTenors: options, SwapTenors: swaps, Quotes: quoteRows(vols)})
+	if e != nil {
+		t.Fatal(e)
+	}
+	spreads := [][]float64{{.0599, .0049, 0, -.0001, .0127}, {.0729, .0086, 0, -.0024, .0098}, {.0738, .0102, 0, -.0039, .0065}, {.0465, .0063, 0, -.0032, -.0010}, {.0558, .0084, 0, -.0050, -.0057}, {.0576, .0083, 0, -.0043, -.0014}, {.0437, .0059, 0, -.0030, -.0006}, {.0533, .0078, 0, -.0045, -.0046}, {.0545, .0079, 0, -.0042, -.0020}}
+	guesses := make([][]float64, 9)
+	for i := range guesses {
+		guesses[i] = []float64{.2, .5, .4, 0}
+	}
+	cfg := SwaptionVolatilityCubeConfig{ATMVol: atm, OptionTenors: []Period{{1, Years}, {10, Years}, {30, Years}}, SwapTenors: []Period{{2, Years}, {10, Years}, {30, Years}}, StrikeSpreads: []float64{-.020, -.005, 0, .005, .020}, VolSpreads: quoteRows(spreads), SwapIndexBase: index, ShortSwapIndexBase: short, Settings: settings, ParametersGuess: quoteRows(guesses)}
+	var cubes [2][2]*SwaptionVolatilityCube
+	for arm := 0; arm < 2; arm++ {
+		for flag := 0; flag < 2; flag++ {
+			cfg.IsATMCalibrated = arm == 1
+			cfg.BackwardFlat = flag == 1
+			cube, e := s.SabrSwaptionVolatilityCube(cfg)
+			if e != nil {
+				t.Fatal(e)
+			}
+			cubes[arm][flag] = cube
+		}
+	}
+	file, e := os.Open("../../crates/libitofin/tests/fixtures/sabr_backward_flat/oracle.csv")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer file.Close()
+	rows, e := csv.NewReader(file).ReadAll()
+	if e != nil {
+		t.Fatal(e)
+	}
+	if len(rows) != 73 {
+		t.Fatalf("oracle row count %d", len(rows))
+	}
+	tenor := func(text string) Period {
+		n, e := strconv.Atoi(strings.TrimSuffix(text, "Y"))
+		if e != nil {
+			t.Fatal(e)
+		}
+		return Period{int32(n), Years}
+	}
+	served := [2]float64{}
+	for _, row := range rows[1:] {
+		arm, e := strconv.Atoi(row[0])
+		if e != nil {
+			t.Fatal(e)
+		}
+		option, swap := tenor(row[1]), tenor(row[2])
+		strike, e := strconv.ParseFloat(row[3], 64)
+		if e != nil {
+			t.Fatal(e)
+		}
+		for flag := 0; flag < 2; flag++ {
+			want, e := strconv.ParseFloat(row[4+flag], 64)
+			if e != nil {
+				t.Fatal(e)
+			}
+			got, e := cubes[arm][flag].Volatility(option, swap, strike, true)
+			if e != nil {
+				t.Fatal(e)
+			}
+			if math.Abs(got-want) > 1e-6 {
+				t.Fatalf("arm %d backward_flat %d %sx%s: got %.15g, C++ %.15g", arm, flag, row[1], row[2], got, want)
+			}
+			served[flag] = got
+		}
+		if gap := math.Abs(served[0] - served[1]); arm == 1 && row[1] == "5Y" {
+			if gap > 1e-12 {
+				t.Fatalf("5Y is a dense node once ATM-calibrated: gap %g", gap)
+			}
+		} else if gap < 1e-3 {
+			t.Fatalf("sample %s/%sx%s cannot detect an ignored BackwardFlat: gap %g", row[0], row[1], row[2], gap)
+		}
+	}
+	// BackwardFlat on the interpolated cube is an error, not silently ignored,
+	// and the session keeps working afterwards.
+	interpCfg := SwaptionVolatilityCubeConfig{ATMVol: atm, OptionTenors: cfg.OptionTenors, SwapTenors: cfg.SwapTenors, StrikeSpreads: cfg.StrikeSpreads, VolSpreads: cfg.VolSpreads, SwapIndexBase: index, ShortSwapIndexBase: short, Settings: settings, BackwardFlat: true}
+	if _, e = s.InterpolatedSwaptionVolatilityCube(interpCfg); e == nil || !strings.Contains(e.Error(), "backward-flat") {
+		t.Fatalf("interpolated cube accepted BackwardFlat: %v", e)
+	}
+	interpCfg.BackwardFlat = false
+	interp, e := s.InterpolatedSwaptionVolatilityCube(interpCfg)
+	if e != nil {
+		t.Fatal(e)
+	}
+	strike, e := interp.ATMStrikeFromTenor(Period{1, Years}, Period{2, Years})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if x, e := interp.Volatility(Period{1, Years}, Period{2, Years}, strike, true); e != nil || x <= 0 {
+		t.Fatal(x, e)
+	}
+}
+
 func TestOptionletStripperGoQueriesAndAdapterOwnership(t *testing.T) {
 	s, e := NewSession()
 	if e != nil {

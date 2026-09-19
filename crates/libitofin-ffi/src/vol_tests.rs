@@ -7,7 +7,7 @@ use libitofin::handle::Handle;
 use libitofin::indexes::{Euribor, SwapIndex};
 use libitofin::interestrate::Compounding;
 use libitofin::math::matrix::Matrix;
-use libitofin::quotes::{SimpleQuote, make_quote_handle};
+use libitofin::quotes::{Quote, SimpleQuote, make_quote_handle};
 use libitofin::settings::Settings;
 use libitofin::shared::{Shared, SharedMut, shared, shared_mut};
 use libitofin::termstructures::{
@@ -18,6 +18,7 @@ use libitofin::time::{
     calendars::target::Target,
     date::{Date, Month},
     daycounters::{
+        actual360::Actual360,
         actual365fixed::Actual365Fixed,
         thirty360::{Convention, Thirty360},
     },
@@ -420,4 +421,235 @@ fn interpolated_cube_boundary_preserves_node_order_and_quote_updates() {
             .unwrap();
         assert!((vol - 0.2).abs() < 1e-10);
     }
+}
+
+/// The backward-flat flag across the C boundary: the QuantLib 1.43 oracle of
+/// `tests/fixtures/sabr_backward_flat` (the CommonVars cube, 72 off-node
+/// samples x sparse/ATM-calibrated x flag off/on, 1e-6), the 0/1 validation,
+/// the interpolated-cube rejection, and the old constructor's equivalence to
+/// an explicit 0. The error arms run first so the passing oracle arm also
+/// proves the context stays usable after a rejected call.
+#[test]
+fn sabr_cube_backward_flat_boundary_matches_quantlib_oracle() {
+    const ORACLE: &str =
+        include_str!("../../libitofin/tests/fixtures/sabr_backward_flat/oracle.csv");
+    let today = Date::new(15, Month::June, 2026);
+    let mut c = Context::new();
+    let settings = shared(Settings::<Date>::new());
+    settings.set_evaluation_date(today);
+    let curve = Handle::new(shared(FlatForward::with_rate(
+        today,
+        0.05,
+        Actual360::new(),
+        Compounding::Continuous,
+        Frequency::Annual,
+    )) as Shared<dyn YieldTermStructure>);
+    let ibor = shared(Euribor::six_months(curve, settings.clone()));
+    let mk_index = |n| {
+        shared(SwapIndex::new(
+            "EuriborSwapIsdaFixA".into(),
+            Period::new(n, TimeUnit::Years),
+            2,
+            Currency::eur(),
+            Target::new(),
+            Period::new(1, TimeUnit::Years),
+            BDC::ModifiedFollowing,
+            Thirty360::with_convention(Convention::BondBasis),
+            ibor.clone(),
+            settings.clone(),
+        ))
+    };
+    let index = c.insert(mk_index(2)).unwrap();
+    let short_index = c.insert(mk_index(1)).unwrap();
+    let atm_vols = [
+        [0.1300, 0.1560, 0.1390, 0.1220],
+        [0.1440, 0.1580, 0.1460, 0.1260],
+        [0.1600, 0.1590, 0.1470, 0.1290],
+        [0.1640, 0.1470, 0.1370, 0.1220],
+        [0.1400, 0.1300, 0.1250, 0.1100],
+        [0.1130, 0.1090, 0.1070, 0.0930],
+    ];
+    let vols: Vec<Vec<Handle<dyn Quote>>> = atm_vols
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|&v| Handle::new(shared(SimpleQuote::new(v)) as Shared<dyn Quote>))
+                .collect()
+        })
+        .collect();
+    let atm = Handle::new(shared(
+        SwaptionVolatilityMatrix::moving(
+            Target::new(),
+            BDC::ModifiedFollowing,
+            [1, 6]
+                .into_iter()
+                .map(|n| Period::new(n, TimeUnit::Months))
+                .chain(
+                    [1, 5, 10, 30]
+                        .into_iter()
+                        .map(|n| Period::new(n, TimeUnit::Years)),
+                )
+                .collect(),
+            [1, 5, 10, 30]
+                .into_iter()
+                .map(|n| Period::new(n, TimeUnit::Years))
+                .collect(),
+            vols,
+            Actual365Fixed::new(),
+            VolatilityType::ShiftedLognormal,
+            Vec::new(),
+            settings.clone(),
+        )
+        .unwrap(),
+    ) as Shared<dyn SwaptionVolatilityStructure>);
+    let atm_id = c.insert(atm).unwrap();
+    let settings_id = c.insert(settings).unwrap();
+    let spread_rows = [
+        [0.0599, 0.0049, 0.0000, -0.0001, 0.0127],
+        [0.0729, 0.0086, 0.0000, -0.0024, 0.0098],
+        [0.0738, 0.0102, 0.0000, -0.0039, 0.0065],
+        [0.0465, 0.0063, 0.0000, -0.0032, -0.0010],
+        [0.0558, 0.0084, 0.0000, -0.0050, -0.0057],
+        [0.0576, 0.0083, 0.0000, -0.0043, -0.0014],
+        [0.0437, 0.0059, 0.0000, -0.0030, -0.0006],
+        [0.0533, 0.0078, 0.0000, -0.0045, -0.0046],
+        [0.0545, 0.0079, 0.0000, -0.0042, -0.0020],
+    ];
+    let spreads: Vec<u64> = spread_rows
+        .iter()
+        .flatten()
+        .map(|&v| c.insert(shared(SimpleQuote::new(v))).unwrap())
+        .collect();
+    let guesses: Vec<u64> = (0..9)
+        .flat_map(|_| [0.2, 0.5, 0.4, 0.0])
+        .map(|v| c.insert(shared(SimpleQuote::new(v))).unwrap())
+        .collect();
+    let options = [1, 10, 30];
+    let swaps = [2, 10, 30];
+    let units = [3, 3, 3];
+    let strikes = [-0.020, -0.005, 0.0, 0.005, 0.020];
+    let fixed = [0, 0, 0, 0];
+    let cfg = |atm_calibrated| ItofinVolCubeConfig {
+        atm: atm_id,
+        index,
+        short_index,
+        settings: settings_id,
+        option_lengths: options.as_ptr(),
+        option_units: units.as_ptr(),
+        options: 3,
+        swap_lengths: swaps.as_ptr(),
+        swap_units: units.as_ptr(),
+        swaps: 3,
+        strike_spreads: strikes.as_ptr(),
+        strikes: 5,
+        vol_spreads: spreads.as_ptr(),
+        vol_count: spreads.len(),
+        guesses: guesses.as_ptr(),
+        guess_count: guesses.len(),
+        fixed: fixed.as_ptr(),
+        atm_calibrated,
+        vega_weighted: 0,
+        use_max_error: 0,
+        max_guesses: 50,
+        cutoff_strike: 0.0001,
+    };
+    let mut result = ItofinVolCubeHandles {
+        surface: 0,
+        cube: 0,
+    };
+    unsafe {
+        // Anything but 0/1 is an argument error, and so is the flag on the
+        // interpolated cube; the context must stay usable after each.
+        for bad in [-1, 2] {
+            assert_eq!(
+                itofin_swaption_vol_cube_new_with_backward_flat(
+                    &mut c,
+                    1,
+                    &cfg(0),
+                    bad,
+                    &mut result,
+                    std::ptr::null_mut()
+                ),
+                INVALID_ARGUMENT,
+                "backward_flat {bad} must be rejected"
+            );
+        }
+        assert_eq!(
+            itofin_swaption_vol_cube_new_with_backward_flat(
+                &mut c,
+                0,
+                &cfg(0),
+                1,
+                &mut result,
+                std::ptr::null_mut()
+            ),
+            INVALID_ARGUMENT,
+            "backward-flat on the interpolated cube must be rejected"
+        );
+    }
+    let mut cubes = [[0_u64; 2]; 2];
+    for (arm, atm_calibrated) in [0, 1].into_iter().enumerate() {
+        for (flag, backward_flat) in [0, 1].into_iter().enumerate() {
+            unsafe {
+                assert_eq!(
+                    itofin_swaption_vol_cube_new_with_backward_flat(
+                        &mut c,
+                        1,
+                        &cfg(atm_calibrated),
+                        backward_flat,
+                        &mut result,
+                        std::ptr::null_mut()
+                    ),
+                    0
+                );
+            }
+            cubes[arm][flag] = result.surface;
+        }
+    }
+    // The old constructor is the explicit-0 form: identical serves.
+    unsafe {
+        assert_eq!(
+            itofin_swaption_vol_cube_new(&mut c, 1, &cfg(1), &mut result, std::ptr::null_mut()),
+            0
+        );
+    }
+    let legacy = result.surface;
+    let surface = |id: u64| {
+        c.get::<Handle<dyn SwaptionVolatilityStructure>>(id)
+            .unwrap()
+            .current_link()
+            .unwrap()
+    };
+    let years = |s: &str| Period::new(s.trim_end_matches('Y').parse().unwrap(), TimeUnit::Years);
+    let mut rows = 0;
+    for line in ORACLE.lines().skip(1) {
+        let cols: Vec<&str> = line.split(',').collect();
+        let arm: usize = cols[0].parse().unwrap();
+        let option = years(cols[1]);
+        let swap = years(cols[2]);
+        let strike: f64 = cols[3].parse().unwrap();
+        for (flag, expected) in cols[4..6].iter().enumerate() {
+            let expected: f64 = expected.parse().unwrap();
+            let got = surface(cubes[arm][flag])
+                .volatility_tenors(option, swap, strike, true)
+                .unwrap();
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "arm {arm} backward_flat {flag} {}/{}: got {got}, C++ {expected}",
+                cols[1],
+                cols[2]
+            );
+            if arm == 1 && flag == 0 {
+                let legacy_got = surface(legacy)
+                    .volatility_tenors(option, swap, strike, true)
+                    .unwrap();
+                assert!(
+                    (legacy_got - got).abs() < 1e-14,
+                    "the legacy constructor must match an explicit backward_flat 0"
+                );
+            }
+        }
+        rows += 1;
+    }
+    assert_eq!(rows, 72);
 }

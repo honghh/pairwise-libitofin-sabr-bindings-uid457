@@ -76,10 +76,45 @@ pub unsafe extern "C" fn itofin_swaption_vol_cube_new(
     out: *mut ItofinVolCubeHandles,
     error: *mut ItofinError,
 ) -> i32 {
+    unsafe { swaption_vol_cube_new(ctx, kind, cfg, 0, out, error) }
+}
+/// Kind: 0 interpolated, 1 SABR. `backward_flat` is 0 or 1 and applies to the
+/// SABR cube only; any other value, or 1 with kind 0, is an argument error.
+/// Both returned handles must be released.
+/// # Safety
+/// Follow the crate C caller contract; arrays must have their stated lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn itofin_swaption_vol_cube_new_with_backward_flat(
+    ctx: *mut Context,
+    kind: i32,
+    cfg: *const ItofinVolCubeConfig,
+    backward_flat: i32,
+    out: *mut ItofinVolCubeHandles,
+    error: *mut ItofinError,
+) -> i32 {
+    unsafe { swaption_vol_cube_new(ctx, kind, cfg, backward_flat, out, error) }
+}
+/// The shared constructor behind both C entry points. `backward_flat` is the
+/// raw C flag: validated to 0/1 here, and rejected for the interpolated cube
+/// rather than silently ignored.
+unsafe fn swaption_vol_cube_new(
+    ctx: *mut Context,
+    kind: i32,
+    cfg: *const ItofinVolCubeConfig,
+    backward_flat: i32,
+    out: *mut ItofinVolCubeHandles,
+    error: *mut ItofinError,
+) -> i32 {
     unsafe {
         with_context(ctx, error, |c| {
             check_ptr(out)?;
             check_ptr(cfg)?;
+            let backward_flat = flag(backward_flat)?;
+            if backward_flat && kind != 1 {
+                return Err(BindingError::invalid(
+                    "backward-flat interpolation applies only to the SABR cube",
+                ));
+            }
             let x = &*cfg;
             let nodes = x
                 .options
@@ -141,7 +176,7 @@ pub unsafe extern "C" fn itofin_swaption_vol_cube_new(
                         None,
                         flag(x.use_max_error)?,
                         x.max_guesses,
-                        false,
+                        backward_flat,
                         x.cutoff_strike,
                         settings,
                     )?);

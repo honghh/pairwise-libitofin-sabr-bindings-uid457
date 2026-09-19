@@ -29,6 +29,11 @@ type SwaptionVolatilityCubeConfig struct {
 	IsATMCalibrated, UseMaxError bool
 	MaxGuesses                   uint
 	CutoffStrike                 float64
+	// BackwardFlat is SABR-only: it interpolates the SABR parameters and the
+	// forward layer backward-flat along the option-time axis. The zero value
+	// keeps the bilinear behaviour, and setting it for the interpolated cube
+	// is an error, not silently ignored.
+	BackwardFlat bool
 }
 
 func (s *Session) InterpolatedSwaptionVolatilityCube(x SwaptionVolatilityCubeConfig) (*SwaptionVolatilityCube, error) {
@@ -132,8 +137,12 @@ func (s *Session) volCube(x SwaptionVolatilityCubeConfig, kind int32) (*Swaption
 		if x.UseMaxError {
 			cfg.use_max_error = 1
 		}
+		var backwardFlat C.int32_t
+		if x.BackwardFlat {
+			backwardFlat = 1
+		}
 		var e C.ItofinError
-		return ffiError(C.itofin_swaption_vol_cube_new(s.ctx, C.int32_t(kind), &cfg, &out, &e), &e)
+		return ffiError(C.itofin_swaption_vol_cube_new_with_backward_flat(s.ctx, C.int32_t(kind), &cfg, backwardFlat, &out, &e), &e)
 	})
 	if err != nil {
 		return nil, err
