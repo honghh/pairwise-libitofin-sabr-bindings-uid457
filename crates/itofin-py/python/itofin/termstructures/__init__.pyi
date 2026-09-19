@@ -2929,14 +2929,13 @@ class SabrSwaptionVolatilityCube(SwaptionVolatilityStructure):
     guess across every node, in that same order.
 
     The end criteria, maximum error tolerance, optimisation method and accepted
-    error are left at the core's C++ defaults. Backward-flat interpolation
-    (core #606) is not exposed, and the optimisation method is always
-    Levenberg-Marquardt, since a trait object does not cross FFI. ZABR and the
-    generic XABR cube are a separate core track (#597), and the section-
-    recalibration API is unported in the core: re-fit by bumping the guess or
-    vol-spread quotes.
+    error are left at the core's C++ defaults, and the optimisation method is
+    always Levenberg-Marquardt, since a trait object does not cross FFI. ZABR
+    and the generic XABR cube are a separate core track (#597), and the
+    section-recalibration API is unported in the core: re-fit by bumping the
+    guess or vol-spread quotes.
     """
-    def __init__(self, atm_vol: SwaptionVolatilityStructure, option_tenors: typing.Sequence[time.Period], swap_tenors: typing.Sequence[time.Period], strike_spreads: typing.Sequence[builtins.float], vol_spreads: typing.Sequence[typing.Sequence[quotes.SimpleQuote]], swap_index_base: indexes.SwapIndex, short_swap_index_base: indexes.SwapIndex, parameters_guess: typing.Sequence[typing.Sequence[quotes.SimpleQuote]], is_parameter_fixed: typing.Sequence[builtins.bool], is_atm_calibrated: builtins.bool, settings: itofin.Settings, vega_weighted_smile_fit: builtins.bool = False, use_max_error: builtins.bool = False, max_guesses: builtins.int = 50, cutoff_strike: builtins.float = 0.0001) -> None:
+    def __init__(self, atm_vol: SwaptionVolatilityStructure, option_tenors: typing.Sequence[time.Period], swap_tenors: typing.Sequence[time.Period], strike_spreads: typing.Sequence[builtins.float], vol_spreads: typing.Sequence[typing.Sequence[quotes.SimpleQuote]], swap_index_base: indexes.SwapIndex, short_swap_index_base: indexes.SwapIndex, parameters_guess: typing.Sequence[typing.Sequence[quotes.SimpleQuote]], is_parameter_fixed: typing.Sequence[builtins.bool], is_atm_calibrated: builtins.bool, settings: itofin.Settings, vega_weighted_smile_fit: builtins.bool = False, use_max_error: builtins.bool = False, max_guesses: builtins.int = 50, cutoff_strike: builtins.float = 0.0001, backward_flat: builtins.bool = False) -> None:
         r"""
         Build the cube, calibrating every node on construction.
 
@@ -2969,6 +2968,9 @@ class SabrSwaptionVolatilityCube(SwaptionVolatilityStructure):
                 error rather than the aggregate one.
             max_guesses (int): How many starting guesses a node may try.
             cutoff_strike (float): The strike floor the fit is evaluated above.
+            backward_flat (bool): Whether the SABR parameters and the forward
+                interpolate backward-flat along option time (swap length stays
+                linear; the market-vol and local-spread grids stay bilinear).
 
         Raises:
             ItofinError: On an empty or ragged vol_spreads or parameters_guess

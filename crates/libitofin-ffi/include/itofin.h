@@ -4177,6 +4177,19 @@ int32_t itofin_swaption_vol_cube_new(struct ItofinContext *ctx,
                                      struct ItofinError *error);
 
 /**
+ * Kind: 0 interpolated, 1 SABR. `backward_flat` is 0 or 1 and only valid for
+ * the SABR cube. Both returned handles must be released.
+ * # Safety
+ * Follow the crate C caller contract; arrays must have their stated lengths.
+ */
+int32_t itofin_swaption_vol_cube_new_with_backward_flat(struct ItofinContext *ctx,
+                                                        int32_t kind,
+                                                        const struct ItofinVolCubeConfig *cfg,
+                                                        int32_t backward_flat,
+                                                        struct ItofinVolCubeHandles *out,
+                                                        struct ItofinError *error);
+
+/**
  * # Safety
  * Follow the crate C caller contract; arrays must have their stated lengths.
  */

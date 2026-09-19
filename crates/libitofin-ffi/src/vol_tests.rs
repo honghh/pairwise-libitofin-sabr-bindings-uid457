@@ -420,4 +420,71 @@ fn interpolated_cube_boundary_preserves_node_order_and_quote_updates() {
             .unwrap();
         assert!((vol - 0.2).abs() < 1e-10);
     }
+
+    // The backward-flat switch takes 0/1 and is SABR-only; both misuses are
+    // argument errors that leave the context usable, and a valid backward-flat
+    // construction still follows. The beta=1, nu=0 limit is interpolation-
+    // independent, so the backward-flat cube serves the same constant smile.
+    unsafe {
+        assert_ne!(
+            itofin_swaption_vol_cube_new_with_backward_flat(
+                &mut c,
+                1,
+                &cfg,
+                2,
+                &mut result,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_ne!(
+            itofin_swaption_vol_cube_new_with_backward_flat(
+                &mut c,
+                1,
+                &cfg,
+                -1,
+                &mut result,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_ne!(
+            itofin_swaption_vol_cube_new_with_backward_flat(
+                &mut c,
+                0,
+                &cfg,
+                1,
+                &mut result,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_eq!(
+            itofin_swaption_vol_cube_new_with_backward_flat(
+                &mut c,
+                1,
+                &cfg,
+                1,
+                &mut result,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+    }
+    let flat = c
+        .get::<Handle<dyn SwaptionVolatilityStructure>>(result.surface)
+        .unwrap()
+        .current_link()
+        .unwrap();
+    for spread in strikes {
+        let vol = flat
+            .volatility_tenors(
+                Period::new(5, TimeUnit::Years),
+                Period::new(5, TimeUnit::Years),
+                atm + spread,
+                true,
+            )
+            .unwrap();
+        assert!((vol - 0.2).abs() < 1e-10);
+    }
 }

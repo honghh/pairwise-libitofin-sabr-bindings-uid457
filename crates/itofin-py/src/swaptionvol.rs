@@ -924,12 +924,11 @@ impl PyInterpolatedSwaptionVolatilityCube {
 /// guess across every node, in that same order.
 ///
 /// The end criteria, maximum error tolerance, optimisation method and accepted
-/// error are left at the core's C++ defaults. Backward-flat interpolation
-/// (core #606) is not exposed, and the optimisation method is always
-/// Levenberg-Marquardt, since a trait object does not cross FFI. ZABR and the
-/// generic XABR cube are a separate core track (#597), and the section-
-/// recalibration API is unported in the core: re-fit by bumping the guess or
-/// vol-spread quotes.
+/// error are left at the core's C++ defaults, and the optimisation method is
+/// always Levenberg-Marquardt, since a trait object does not cross FFI. ZABR
+/// and the generic XABR cube are a separate core track (#597), and the
+/// section-recalibration API is unported in the core: re-fit by bumping the
+/// guess or vol-spread quotes.
 #[gen_stub_pyclass]
 #[pyclass(name = "SabrSwaptionVolatilityCube", extends = PySwaptionVolatilityStructure, unsendable, module = "itofin.termstructures")]
 pub struct PySabrSwaptionVolatilityCube {
@@ -970,6 +969,9 @@ impl PySabrSwaptionVolatilityCube {
     ///         error rather than the aggregate one.
     ///     max_guesses (int): How many starting guesses a node may try.
     ///     cutoff_strike (float): The strike floor the fit is evaluated above.
+    ///     backward_flat (bool): Whether the SABR parameters and the forward
+    ///         interpolate backward-flat along option time (swap length stays
+    ///         linear; the market-vol and local-spread grids stay bilinear).
     ///
     /// Raises:
     ///     ItofinError: On an empty or ragged vol_spreads or parameters_guess
@@ -980,7 +982,7 @@ impl PySabrSwaptionVolatilityCube {
     #[gen_stub(override_return_type(type_repr = "SabrSwaptionVolatilityCube"))]
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (atm_vol, option_tenors, swap_tenors, strike_spreads, vol_spreads, swap_index_base, short_swap_index_base, parameters_guess, is_parameter_fixed, is_atm_calibrated, settings, vega_weighted_smile_fit = false, use_max_error = false, max_guesses = 50, cutoff_strike = 0.0001))]
+    #[pyo3(signature = (atm_vol, option_tenors, swap_tenors, strike_spreads, vol_spreads, swap_index_base, short_swap_index_base, parameters_guess, is_parameter_fixed, is_atm_calibrated, settings, vega_weighted_smile_fit = false, use_max_error = false, max_guesses = 50, cutoff_strike = 0.0001, backward_flat = false))]
     fn new(
         atm_vol: &PySwaptionVolatilityStructure,
         option_tenors: Vec<PyRef<'_, PyPeriod>>,
@@ -997,6 +999,7 @@ impl PySabrSwaptionVolatilityCube {
         use_max_error: bool,
         max_guesses: usize,
         cutoff_strike: f64,
+        backward_flat: bool,
     ) -> PyResult<PyClassInitializer<Self>> {
         let nodes = option_tenors.len() * swap_tenors.len();
         let vol_spreads = node_grid(
@@ -1040,7 +1043,7 @@ impl PySabrSwaptionVolatilityCube {
                 None,
                 use_max_error,
                 max_guesses,
-                false,
+                backward_flat,
                 cutoff_strike,
                 settings.inner(),
             )

@@ -1,7 +1,12 @@
 package itofin
 
 import (
+	"encoding/csv"
+	"io"
 	"math"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -321,5 +326,233 @@ func TestSABRCubeFreeCalibrationPythonOracle(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// commonSABRCubeConfig is the Public QuantLib swaptionvolstructuresutilities
+// fixture of TestSABRCubeFreeCalibrationPythonOracle, returned ready for the
+// IsATMCalibrated and BackwardFlat switches to be flipped per construction.
+func commonSABRCubeConfig(t *testing.T, s *Session, settings *Settings) SwaptionVolatilityCubeConfig {
+	t.Helper()
+	dc, _ := s.Actual365Fixed()
+	curveDC, _ := s.Actual360()
+	fixedDC, _ := s.Thirty360BondBasis()
+	cal, _ := s.Target()
+	eur, _ := s.EUR()
+	curve, e := s.NewFlatForward(volDate(t, 15, 6, 2026), .05, curveDC)
+	if e != nil {
+		t.Fatal(e)
+	}
+	ibor, e := s.NewEuriborSixMonths(curve, settings)
+	if e != nil {
+		t.Fatal(e)
+	}
+	ic := SwapIndexConfig{Family: "EuriborSwapIsdaFixA", Tenor: Period{2, Years}, FixedLegTenor: Period{1, Years}, SettlementDays: 2, Currency: eur, Calendar: cal, FixedLegConvention: ModifiedFollowing, FixedLegDayCounter: fixedDC, Index: ibor, Settings: settings}
+	index, e := s.NewSwapIndex(ic)
+	if e != nil {
+		t.Fatal(e)
+	}
+	ic.Tenor = Period{1, Years}
+	short, e := s.NewSwapIndex(ic)
+	if e != nil {
+		t.Fatal(e)
+	}
+	quoteRows := func(values [][]float64) [][]*SimpleQuote {
+		rows := make([][]*SimpleQuote, len(values))
+		for i, row := range values {
+			rows[i] = make([]*SimpleQuote, len(row))
+			for j, v := range row {
+				q, e := s.NewSimpleQuote(v)
+				if e != nil {
+					t.Fatal(e)
+				}
+				rows[i][j] = q
+			}
+		}
+		return rows
+	}
+	options := []Period{{1, Months}, {6, Months}, {1, Years}, {5, Years}, {10, Years}, {30, Years}}
+	swaps := []Period{{1, Years}, {5, Years}, {10, Years}, {30, Years}}
+	vols := [][]float64{{.1300, .1560, .1390, .1220}, {.1440, .1580, .1460, .1260}, {.1600, .1590, .1470, .1290}, {.1640, .1470, .1370, .1220}, {.1400, .1300, .1250, .1100}, {.1130, .1090, .1070, .0930}}
+	atm, e := s.SwaptionVolatilityMatrix(RateVolGridConfig{Calendar: cal, Convention: ModifiedFollowing, DayCounter: dc, Settings: settings, OptionTenors: options, SwapTenors: swaps, Quotes: quoteRows(vols)})
+	if e != nil {
+		t.Fatal(e)
+	}
+	spreads := [][]float64{{.0599, .0049, 0, -.0001, .0127}, {.0729, .0086, 0, -.0024, .0098}, {.0738, .0102, 0, -.0039, .0065}, {.0465, .0063, 0, -.0032, -.0010}, {.0558, .0084, 0, -.0050, -.0057}, {.0576, .0083, 0, -.0043, -.0014}, {.0437, .0059, 0, -.0030, -.0006}, {.0533, .0078, 0, -.0045, -.0046}, {.0545, .0079, 0, -.0042, -.0020}}
+	guesses := make([][]float64, 9)
+	for i := range guesses {
+		guesses[i] = []float64{.2, .5, .4, 0}
+	}
+	return SwaptionVolatilityCubeConfig{ATMVol: atm, OptionTenors: []Period{{1, Years}, {10, Years}, {30, Years}}, SwapTenors: []Period{{2, Years}, {10, Years}, {30, Years}}, StrikeSpreads: []float64{-.020, -.005, 0, .005, .020}, VolSpreads: quoteRows(spreads), SwapIndexBase: index, ShortSwapIndexBase: short, Settings: settings, ParametersGuess: quoteRows(guesses)}
+}
+
+// The QuantLib 1.43 backward-flat oracle (core #606 fixture): 72 off-node
+// samples over both calibration arms and both switch values, each within
+// 1e-6. The spread between the two switch columns proves the samples would
+// catch the switch being silently ignored; the 1e-6 match itself catches a
+// transposed axis or a wrong dense interpolation.
+func TestSABRCubeBackwardFlatQuantlibOracle(t *testing.T) {
+	s, e := NewSession()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	settings, _ := s.NewSettings()
+	if e = settings.SetEvaluationDate(volDate(t, 15, 6, 2026)); e != nil {
+		t.Fatal(e)
+	}
+	cfg := commonSABRCubeConfig(t, s, settings)
+	cubes := map[[2]bool]*SwaptionVolatilityCube{}
+	for _, arm := range []bool{false, true} {
+		for _, flag := range []bool{false, true} {
+			cfg.IsATMCalibrated = arm
+			cfg.BackwardFlat = flag
+			cube, e := s.SabrSwaptionVolatilityCube(cfg)
+			if e != nil {
+				t.Fatal(e)
+			}
+			cubes[[2]bool{arm, flag}] = cube
+		}
+	}
+	file, e := os.Open("../../crates/libitofin/tests/fixtures/sabr_backward_flat/oracle.csv")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer file.Close()
+	tenor := func(text string) Period {
+		n, e := strconv.Atoi(strings.TrimSuffix(text, "Y"))
+		if e != nil {
+			t.Fatal(e)
+		}
+		return Period{int32(n), Years}
+	}
+	reader := csv.NewReader(file)
+	if _, e = reader.Read(); e != nil {
+		t.Fatal(e)
+	}
+	rows := 0
+	worst, effect := 0., 0.
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		arm := record[0] == "1"
+		option, swap := tenor(record[1]), tenor(record[2])
+		strike, e := strconv.ParseFloat(record[3], 64)
+		if e != nil {
+			t.Fatal(e)
+		}
+		served := make([]float64, 2)
+		for i, flag := range []bool{false, true} {
+			want, e := strconv.ParseFloat(record[4+i], 64)
+			if e != nil {
+				t.Fatal(e)
+			}
+			got, e := cubes[[2]bool{arm, flag}].Volatility(option, swap, strike, true)
+			if e != nil {
+				t.Fatal(e)
+			}
+			served[i] = got
+			if diff := math.Abs(got - want); diff > worst {
+				worst = diff
+			}
+			if math.Abs(got-want) > 1e-6 {
+				t.Fatalf("arm %v backward_flat %v %sx%s strike %v: got %v, QuantLib %v", arm, flag, record[1], record[2], strike, got, want)
+			}
+		}
+		if diff := math.Abs(served[0] - served[1]); diff > effect {
+			effect = diff
+		}
+		rows++
+	}
+	if rows != 72 {
+		t.Fatalf("oracle rows: got %d, want 72", rows)
+	}
+	if worst > 1e-6 {
+		t.Fatalf("worst oracle error %g", worst)
+	}
+	if effect < 1e-3 {
+		t.Fatalf("samples do not discriminate the switch: max effect %g", effect)
+	}
+}
+
+// The switch is SABR-only: the interpolated cube rejects it, and the session
+// stays usable for a valid backward-flat construction afterwards.
+func TestBackwardFlatRejectedOnInterpolatedCube(t *testing.T) {
+	s, e := NewSession()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	settings, _ := s.NewSettings()
+	ref := volDate(t, 15, 6, 2026)
+	if e = settings.SetEvaluationDate(ref); e != nil {
+		t.Fatal(e)
+	}
+	dc, _ := s.Actual365Fixed()
+	fixedDC, _ := s.Thirty360BondBasis()
+	cal, _ := s.Target()
+	eur, _ := s.EUR()
+	curve, e := s.NewFlatForward(ref, .05, dc)
+	if e != nil {
+		t.Fatal(e)
+	}
+	ibor, e := s.NewEuriborSixMonths(curve, settings)
+	if e != nil {
+		t.Fatal(e)
+	}
+	ic := SwapIndexConfig{Family: "test", Tenor: Period{2, Years}, FixedLegTenor: Period{1, Years}, SettlementDays: 2, Currency: eur, Calendar: cal, FixedLegConvention: ModifiedFollowing, FixedLegDayCounter: fixedDC, Index: ibor, Settings: settings}
+	index, e := s.NewSwapIndex(ic)
+	if e != nil {
+		t.Fatal(e)
+	}
+	ic.Tenor = Period{1, Years}
+	short, e := s.NewSwapIndex(ic)
+	if e != nil {
+		t.Fatal(e)
+	}
+	atm, e := s.ConstantSwaptionVolatility(ConstantRateVolConfig{Calendar: cal, Convention: ModifiedFollowing, DayCounter: dc, Settings: settings, Volatility: .2})
+	if e != nil {
+		t.Fatal(e)
+	}
+	cfg := SwaptionVolatilityCubeConfig{ATMVol: atm, OptionTenors: []Period{{1, Years}, {5, Years}, {10, Years}}, SwapTenors: []Period{{2, Years}, {5, Years}, {10, Years}}, StrikeSpreads: []float64{-.01, 0, .01}, SwapIndexBase: index, ShortSwapIndexBase: short, Settings: settings}
+	for node := 0; node < 9; node++ {
+		row := make([]*SimpleQuote, 3)
+		for k := range row {
+			if row[k], e = s.NewSimpleQuote(0); e != nil {
+				t.Fatal(e)
+			}
+		}
+		cfg.VolSpreads = append(cfg.VolSpreads, row)
+		guess := make([]*SimpleQuote, 4)
+		for k, v := range []float64{.2, 1, 0, 0} {
+			if guess[k], e = s.NewSimpleQuote(v); e != nil {
+				t.Fatal(e)
+			}
+		}
+		cfg.ParametersGuess = append(cfg.ParametersGuess, guess)
+	}
+	cfg.BackwardFlat = true
+	if _, e = s.InterpolatedSwaptionVolatilityCube(cfg); e == nil {
+		t.Fatal("interpolated cube accepted backward-flat")
+	}
+	// SABR's beta=1, nu=0 limit is a constant lognormal smile, so the valid
+	// backward-flat construction on the still-usable session serves 0.2.
+	cfg.IsParameterFixed = [4]bool{true, true, true, true}
+	sabr, e := s.SabrSwaptionVolatilityCube(cfg)
+	if e != nil {
+		t.Fatal(e)
+	}
+	strike, e := sabr.ATMStrikeFromTenor(Period{5, Years}, Period{5, Years})
+	if e != nil {
+		t.Fatal(e)
+	}
+	for _, spread := range cfg.StrikeSpreads {
+		x, e := sabr.Volatility(Period{5, Years}, Period{5, Years}, strike+spread, true)
+		volNear(t, x, .2, e)
 	}
 }

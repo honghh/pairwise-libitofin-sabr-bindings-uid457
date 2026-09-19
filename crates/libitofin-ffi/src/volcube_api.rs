@@ -76,10 +76,26 @@ pub unsafe extern "C" fn itofin_swaption_vol_cube_new(
     out: *mut ItofinVolCubeHandles,
     error: *mut ItofinError,
 ) -> i32 {
+    unsafe { itofin_swaption_vol_cube_new_with_backward_flat(ctx, kind, cfg, 0, out, error) }
+}
+/// Kind: 0 interpolated, 1 SABR. `backward_flat` is 0 or 1 and only valid for
+/// the SABR cube. Both returned handles must be released.
+/// # Safety
+/// Follow the crate C caller contract; arrays must have their stated lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn itofin_swaption_vol_cube_new_with_backward_flat(
+    ctx: *mut Context,
+    kind: i32,
+    cfg: *const ItofinVolCubeConfig,
+    backward_flat: i32,
+    out: *mut ItofinVolCubeHandles,
+    error: *mut ItofinError,
+) -> i32 {
     unsafe {
         with_context(ctx, error, |c| {
             check_ptr(out)?;
             check_ptr(cfg)?;
+            let backward_flat = flag(backward_flat)?;
             let x = &*cfg;
             let nodes = x
                 .options
@@ -104,6 +120,11 @@ pub unsafe extern "C" fn itofin_swaption_vol_cube_new(
             let vega = flag(x.vega_weighted)?;
             let (surface, cube) = match kind {
                 0 => {
+                    if backward_flat {
+                        return Err(BindingError::invalid(
+                            "backward-flat interpolation is only available on the SABR cube",
+                        ));
+                    }
                     let v = shared(InterpolatedSwaptionVolatilityCube::new(
                         atm, options, swaps, strikes, vols, index, short, vega, settings,
                     )?);
@@ -141,7 +162,7 @@ pub unsafe extern "C" fn itofin_swaption_vol_cube_new(
                         None,
                         flag(x.use_max_error)?,
                         x.max_guesses,
-                        false,
+                        backward_flat,
                         x.cutoff_strike,
                         settings,
                     )?);

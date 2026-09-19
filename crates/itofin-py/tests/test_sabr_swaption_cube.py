@@ -45,6 +45,10 @@ The cube is calibrated once for the whole module: a Levenberg-Marquardt fit per
 node plus the dense pass is the expensive part, and no arm mutates a quote.
 """
 
+# standard library
+import csv
+from pathlib import Path
+
 # pypi/conda library
 import pytest
 
@@ -110,6 +114,11 @@ PARAMETERS_GUESS = [0.2, 0.5, 0.4, 0.0]
 
 SETTINGS = Settings()
 SETTINGS.set_evaluation_date(EVAL)
+
+BACKWARD_FLAT_ORACLE = (
+    Path(__file__).resolve().parents[2]
+    / "libitofin/tests/fixtures/sabr_backward_flat/oracle.csv"
+)
 
 ENGINE_OPTION_TENOR = Period(2, "Years")
 ENGINE_SWAP_TENOR = Period(7, "Years")
@@ -338,3 +347,163 @@ def test_the_cube_rejects_a_mis_shaped_guess_or_spread_grid(sabr_cube):
         build(spreads, [row[:-1] for row in guesses], flags)
     with pytest.raises(ItofinError, match="one flag per SABR parameter"):
         build(spreads, guesses, flags[:-1])
+
+
+def _build_cube(settings, is_atm_calibrated, backward_flat, live_spread=None, omit_flag=False):
+    """The module fixture's cube with the backward-flat switch wired through.
+
+    ``live_spread`` replaces the (10Y, 2Y) node's far-put spread quote (row 3,
+    column 0) so a test can bump it; ``omit_flag`` drops the keyword entirely
+    to exercise the constructor default.
+    """
+    curve = FlatForward(EVAL, RATE, DayCounter.actual360())
+    euribor6m = Euribor.six_months(curve, settings)
+    atm = SwaptionVolatilityMatrix.moving(
+        Calendar.target(),
+        BDC,
+        ATM_OPTION_TENORS,
+        ATM_SWAP_TENORS,
+        [[SimpleQuote(vol) for vol in row] for row in ATM_VOLS],
+        DayCounter.actual365_fixed(),
+        VolatilityType.ShiftedLognormal,
+        settings,
+    )
+    spreads = [
+        [
+            live_spread if n == 3 and k == 0 and live_spread is not None else SimpleQuote(spread)
+            for k, spread in enumerate(row)
+        ]
+        for n, row in enumerate(VOL_SPREADS)
+    ]
+    kwargs = {} if omit_flag else {"backward_flat": backward_flat}
+    return SabrSwaptionVolatilityCube(
+        atm,
+        OPTION_TENORS,
+        SWAP_TENORS,
+        STRIKE_SPREADS,
+        spreads,
+        _swap_index(Period(2, "Years"), euribor6m),
+        _swap_index(Period(1, "Years"), euribor6m),
+        [[SimpleQuote(guess) for guess in PARAMETERS_GUESS] for _ in VOL_SPREADS],
+        [False, False, False, False],
+        is_atm_calibrated,
+        settings,
+        **kwargs,
+    )
+
+
+@pytest.fixture(scope="module")
+def backward_flat_cubes():
+    """All four (is_atm_calibrated, backward_flat) arms of the module fixture."""
+    return {
+        (arm, flag): _build_cube(SETTINGS, arm, flag)
+        for arm in (False, True)
+        for flag in (False, True)
+    }
+
+
+def test_backward_flat_matches_the_quantlib_oracle(backward_flat_cubes):
+    """The QuantLib 1.43 backward-flat oracle (core #606 fixture): 72 off-node
+    samples over both calibration arms and both switch values, each within
+    1e-6. The 1e-6 match itself catches a transposed axis or a wrong dense
+    interpolation; the spread between the two switch columns proves the
+    samples would also catch the switch being silently ignored."""
+    rows = 0
+    worst = 0.0
+    switch_effect = 0.0
+    with BACKWARD_FLAT_ORACLE.open() as stream:
+        for record in csv.DictReader(stream):
+            arm = record["is_atm_calibrated"] == "1"
+            option_tenor = Period(int(record["option_tenor"].rstrip("Y")), "Years")
+            swap_tenor = Period(int(record["swap_tenor"].rstrip("Y")), "Years")
+            strike = float(record["strike"])
+            served = tuple(
+                backward_flat_cubes[arm, flag].volatility(option_tenor, swap_tenor, strike, True)
+                for flag in (False, True)
+            )
+            expected = (float(record["vol_bilinear"]), float(record["vol_backward_flat"]))
+            for flag, (got, want) in enumerate(zip(served, expected)):
+                error = abs(got - want)
+                worst = max(worst, error)
+                assert error < 1e-6, (
+                    f"arm {arm} backward_flat={bool(flag)} "
+                    f"{record['option_tenor']}x{record['swap_tenor']} strike {strike}: "
+                    f"got {got}, QuantLib {want}"
+                )
+            switch_effect = max(switch_effect, abs(served[0] - served[1]))
+            rows += 1
+    print(f"\nworst oracle error = {worst!r} over {rows} rows")
+    assert rows == 72
+    assert switch_effect > 1e-3, "the samples must discriminate the switch"
+
+
+def test_omitted_backward_flat_matches_explicit_false(backward_flat_cubes):
+    """The constructor default is false: omitting the argument and passing
+    ``backward_flat=False`` calibrate the same cube."""
+    for arm in (False, True):
+        omitted = _build_cube(SETTINGS, arm, None, omit_flag=True)
+        explicit = backward_flat_cubes[arm, False]
+        for option_tenor in (Period(2, "Years"), Period(7, "Years")):
+            for swap_tenor in (Period(5, "Years"), Period(20, "Years")):
+                strike = omitted.atm_strike_from_tenor(option_tenor, swap_tenor)
+                served = omitted.volatility(option_tenor, swap_tenor, strike, True)
+                assert served == pytest.approx(
+                    explicit.volatility(option_tenor, swap_tenor, strike, True), abs=1e-14
+                )
+
+
+def test_backward_flat_survives_quote_and_evaluation_date_changes():
+    """A backward-flat cube recalibrates, still backward-flat, when a spread
+    quote bumps or the evaluation date moves: after either change it agrees
+    with a freshly built backward-flat cube and still disagrees with the
+    bilinear one (the core's
+    ``backward_flat_recalibrates_after_live_quote_and_evaluation_date_updates``)."""
+    for is_atm_calibrated in (False, True):
+        settings = Settings()
+        settings.set_evaluation_date(EVAL)
+        live = SimpleQuote(VOL_SPREADS[3][0])
+
+        def build(backward_flat):
+            return _build_cube(settings, is_atm_calibrated, backward_flat, live_spread=live)
+
+        cube = build(True)
+
+        def value(built):
+            return built.volatility(Period(2, "Years"), Period(5, "Years"), 0.05, False)
+
+        initial = value(cube)
+        assert abs(initial - value(build(False))) > 1e-3
+
+        live.set_value(VOL_SPREADS[3][0] + 0.01)
+        after_quote = value(cube)
+        assert abs(after_quote - initial) > 1e-7
+        assert abs(after_quote - value(build(True))) < 1e-14
+        assert abs(after_quote - value(build(False))) > 1e-3
+
+        settings.set_evaluation_date(Calendar.target().advance(EVAL, 1, "Days", BDC, False))
+        after_date = value(cube)
+        assert abs(after_date - after_quote) > 1e-10
+        assert abs(after_date - value(build(True))) < 1e-14
+        assert abs(after_date - value(build(False))) > 1e-3
+
+
+def test_the_interpolated_cube_has_no_backward_flat_switch(sabr_cube):
+    """The switch is SABR-only: the interpolated cube rejects the keyword
+    instead of silently ignoring it."""
+    from itofin.termstructures import InterpolatedSwaptionVolatilityCube
+
+    _curve, atm, _cube = sabr_cube
+    curve = FlatForward(EVAL, RATE, DayCounter.actual360())
+    euribor6m = Euribor.six_months(curve, SETTINGS)
+    with pytest.raises(TypeError, match="backward_flat"):
+        InterpolatedSwaptionVolatilityCube(
+            atm,
+            OPTION_TENORS,
+            SWAP_TENORS,
+            STRIKE_SPREADS,
+            [[SimpleQuote(spread) for spread in row] for row in VOL_SPREADS],
+            _swap_index(Period(2, "Years"), euribor6m),
+            _swap_index(Period(1, "Years"), euribor6m),
+            SETTINGS,
+            backward_flat=True,
+        )
