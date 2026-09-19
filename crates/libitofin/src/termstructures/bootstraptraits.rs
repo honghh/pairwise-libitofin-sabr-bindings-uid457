@@ -1,0 +1,817 @@
+//! Bootstrap traits and the mutable node plumbing they drive.
+//!
+//! Port of `ql/termstructures/yield/bootstraptraits.hpp` (the `Discount`
+//! traits) together with the curve-side node storage the bootstrap mutates.
+//!
+//! ## The mutation decision
+//!
+//! In C++ `IterativeBootstrap` is a *friend* of `PiecewiseYieldCurve` and
+//! writes straight into `ts_->data_`, `ts_->interpolation_` and `ts_->dates_`
+//! (`iterativebootstrap.hpp:296-316`). Rust has no friendship and no
+//! inheritance, so the decision this port makes is: the node data lives in a
+//! [`CurveData`] holder the curve keeps behind a `RefCell`, and the bootstrap
+//! mutates it through this type's methods. The bootstrap borrows the cell
+//! mutably to write one node and rebuild the interpolation over the solved
+//! prefix, then *drops that borrow* before asking a helper to reprice - the
+//! helper reads the same curve back (through its weak handle), so the two
+//! borrows must never overlap. That discipline is what makes a `RefCell`
+//! sufficient here instead of a second ownership scheme.
+//!
+//! ## Scope
+//!
+//! All four upstream yield conventions are ported: `Discount`, `ZeroYield`,
+//! `ForwardRate` and `SimpleZeroYield` (`bootstraptraits.hpp:312`), the last
+//! adding the `-1/t` rate floor its simply compounded nodes need.
+//!
+//! ## The trait split
+//!
+//! C++ has one trait struct per convention. This port splits the Rust trait in
+//! two along the line the bootstrap driver draws: [`BootstrapTraits`] carries
+//! the six statics the driver calls to solve a node, and
+//! [`YieldBootstrapTraits`] adds `discount_from_nodes`, which only a yield
+//! curve's `discount_impl` calls. That lets the one driver serve a second
+//! term-structure family whose nodes are not discount factors.
+
+use crate::errors::QlResult;
+use crate::math::interpolations::{Interpolation, Interpolator};
+use crate::time::date::Date;
+use crate::types::{DiscountFactor, Real, Size, Time};
+use crate::{fail, require};
+
+/// The average and maximum instantaneous rate the `Discount` bracket/guess
+/// formulas assume (`detail::avgRate` / `detail::maxRate`,
+/// `bootstraptraits.hpp:39-40`).
+const AVG_RATE: Real = 0.05;
+const MAX_RATE: Real = 1.0;
+
+/// Curve-shape traits that drive the bootstrap's initial value, per-node guess
+/// and search bracket (C++'s `Discount`/`ZeroYield`/... trait structs).
+///
+/// The formulas here are load-bearing: they are what makes the per-node root
+/// search converge, so they transcribe the C++ statics exactly rather than
+/// being reinvented. Every method reads the node `times` and the partially
+/// solved `data`, matching the C++ `c->times()` / `c->data()` access.
+///
+/// This is exactly the set the bootstrap driver calls
+/// (`iterativebootstrap.rs`'s `calculate`), and nothing more: the node-to-
+/// discount conversion a *yield* curve additionally needs lives on
+/// [`YieldBootstrapTraits`], because the driver never calls it and a credit
+/// convention (a hazard rate) has no discount factor to hand back.
+pub trait BootstrapTraits {
+    /// The value at the reference-date node (`Traits::initialValue`).
+    fn initial_value() -> Real;
+
+    /// The initial guess for node `i` (`Traits::guess`). `valid_data` is set
+    /// when a previous curve state is being reused as the starting point.
+    fn guess(i: Size, times: &[Time], data: &[Real], valid_data: bool) -> Real;
+
+    /// The lower bracket bound for node `i` (`Traits::minValueAfter`).
+    fn min_value_after(i: Size, times: &[Time], data: &[Real], valid_data: bool) -> Real;
+
+    /// The upper bracket bound for node `i` (`Traits::maxValueAfter`).
+    fn max_value_after(i: Size, times: &[Time], data: &[Real], valid_data: bool) -> Real;
+
+    /// Writes a solved value back into the node vector (`Traits::updateGuess`).
+    fn update_guess(data: &mut [Real], value: Real, i: Size);
+
+    /// The convergence-loop iteration cap (`Traits::maxIterations`).
+    fn max_iterations() -> Size;
+}
+
+/// The extra trait a *yield* curve convention carries: turning a solved node
+/// back into a discount factor.
+///
+/// C++ keeps this on the same `Discount`/`ZeroYield`/`ForwardRate` structs
+/// (`bootstraptraits.hpp`) because those structs only ever serve
+/// `PiecewiseYieldCurve`. This port splits it off [`BootstrapTraits`] so a
+/// second term-structure family can reuse the driver: the bootstrap solves
+/// nodes through [`BootstrapTraits`] alone, and only
+/// [`PiecewiseYieldCurve`](crate::termstructures::yields::PiecewiseYieldCurve)'s
+/// `discount_impl` needs the conversion. A credit convention (a hazard rate)
+/// implements the core trait and simply does not implement this one, rather
+/// than carrying a method it has no meaning for.
+pub trait YieldBootstrapTraits: BootstrapTraits {
+    /// Converts an interpolated node at time `t` into a discount factor,
+    /// applying this convention's node meaning (a discount factor for
+    /// `Discount`, `exp(-z*t)` for a continuously compounded zero rate,
+    /// `1/(1 + z*t)` for a simply compounded one, `exp(-primitive)` for an
+    /// instantaneous forward). This is the seam that lets one `CurveData`
+    /// holder serve every convention: the holder stays convention-agnostic and
+    /// the traits interpret its nodes.
+    ///
+    /// Everything a conversion needs - the last solved node time, its value,
+    /// the derivative and the antiderivative - is carried by the
+    /// [`Interpolation`] the bootstrap rebuilt over the solved prefix
+    /// `[0, upto]`, so `interpolation.x_max()` is that last node's time and
+    /// `value(x_max)` its value; past it every convention extends the last
+    /// instantaneous forward flat.
+    fn discount_from_nodes<I: Interpolation>(
+        interpolation: &I,
+        t: Time,
+    ) -> QlResult<DiscountFactor>;
+
+    /// Maps an unconstrained optimizer variable into a curve node value
+    /// (`Traits::transformDirect`). The global bootstrap searches all interior
+    /// nodes simultaneously in an unconstrained space, and this transform is
+    /// what keeps each trial node admissible - `exp` keeps a trial discount
+    /// factor positive where the iterative bootstrap would have bracketed it.
+    ///
+    /// The C++ signature takes the node index and the curve
+    /// (`transformDirect(x, i, c)`), and the only thing any trait reads
+    /// through them is `c->times()[i]`, so the port passes that node time `t`
+    /// directly. `Discount`, `ZeroYield` and `ForwardRate` ignore it;
+    /// `SimpleZeroYield` (`bootstraptraits.hpp:385-393`) shifts its image by
+    /// the same `-1/t` rate floor its bracket applies. Identity by default -
+    /// `ZeroYield` (`:197-204`) and `ForwardRate` (`:290-295`) are identity
+    /// upstream - and `Discount` overrides with `exp` (`:106-109`).
+    fn transform_direct(x: Real, _t: Time) -> Real {
+        x
+    }
+
+    /// The inverse of [`transform_direct`](Self::transform_direct)
+    /// (`Traits::transformInverse`): maps a node value at node time `t` into
+    /// the optimizer space, so `transform_direct(transform_inverse(x, t), t)
+    /// == x`. Identity by default; `Discount` overrides with `log`
+    /// (`bootstraptraits.hpp:110-113`).
+    fn transform_inverse(x: Real, _t: Time) -> Real {
+        x
+    }
+}
+
+/// Discount-factor bootstrap traits (`struct Discount`,
+/// `bootstraptraits.hpp:44`). The curve nodes are discount factors, the
+/// reference node is 1.0, and the bracket keeps every factor positive and
+/// bounded by a `MAX_RATE` instantaneous forward over each segment.
+pub struct Discount;
+
+impl BootstrapTraits for Discount {
+    fn initial_value() -> Real {
+        1.0
+    }
+
+    fn guess(i: Size, times: &[Time], data: &[Real], valid_data: bool) -> Real {
+        if valid_data {
+            return data[i];
+        }
+        if i == 1 {
+            return 1.0 / (1.0 + AVG_RATE * times[1]);
+        }
+        // flat instantaneous-forward extrapolation from the previous node
+        let r = -data[i - 1].ln() / times[i - 1];
+        (-r * times[i]).exp()
+    }
+
+    fn min_value_after(i: Size, times: &[Time], data: &[Real], valid_data: bool) -> Real {
+        if valid_data {
+            let min = data.iter().copied().fold(Real::INFINITY, Real::min);
+            return min / 2.0;
+        }
+        let dt = times[i] - times[i - 1];
+        data[i - 1] * (-MAX_RATE * dt).exp()
+    }
+
+    fn max_value_after(i: Size, times: &[Time], data: &[Real], _valid_data: bool) -> Real {
+        let dt = times[i] - times[i - 1];
+        data[i - 1] * (MAX_RATE * dt).exp()
+    }
+
+    fn update_guess(data: &mut [Real], value: Real, i: Size) {
+        data[i] = value;
+    }
+
+    fn max_iterations() -> Size {
+        100
+    }
+}
+
+impl YieldBootstrapTraits for Discount {
+    /// The nodes are already discount factors, so the value is the discount
+    /// factor directly (in range), and past the last solved node the last
+    /// instantaneous forward continues flat (the port of
+    /// `InterpolatedDiscountCurve::discountImpl`).
+    fn discount_from_nodes<I: Interpolation>(
+        interpolation: &I,
+        t: Time,
+    ) -> QlResult<DiscountFactor> {
+        let t_max = interpolation.x_max();
+        if t <= t_max {
+            return interpolation.value(t);
+        }
+        let d_max = interpolation.value(t_max)?;
+        let inst_fwd_max = -interpolation.derivative(t_max)? / d_max;
+        Ok(d_max * (-inst_fwd_max * (t - t_max)).exp())
+    }
+
+    /// `exp` (`bootstraptraits.hpp:106-109`): the optimizer variable is the
+    /// log-discount, so every trial discount factor stays positive. The node
+    /// time is unused, as it is upstream.
+    fn transform_direct(x: Real, _t: Time) -> Real {
+        x.exp()
+    }
+
+    /// `log` (`bootstraptraits.hpp:110-113`).
+    fn transform_inverse(x: Real, _t: Time) -> Real {
+        x.ln()
+    }
+}
+
+/// The per-node guess the rate-storing conventions share (`ZeroYield`/
+/// `ForwardRate`/`SimpleZeroYield` `guess`, `bootstraptraits.hpp:147-163`/
+/// `:246-256`/`:332-348`). The C++ extrapolation branch reprices the partial
+/// curve's own `zeroRate`/`forwardRate` (`zeroRate(d, dc, Simple, Annual,
+/// true)` for `SimpleZeroYield`, `:344-347`); the Rust trait only receives
+/// the node slices, so this returns
+/// the last solved node instead. That is benign by construction: the guess only
+/// seeds a bracketed solver whose converged root is independent of it, and the
+/// caller already clamps the guess into `[min, max]`
+/// (`iterativebootstrap.rs:182-186`).
+fn rate_guess(i: Size, data: &[Real], valid_data: bool) -> Real {
+    if valid_data {
+        return data[i];
+    }
+    if i == 1 {
+        return AVG_RATE;
+    }
+    data[i - 1]
+}
+
+/// The lower bracket the rate-storing conventions share (`minValueAfter`,
+/// `:167-179`/`:266-278`): half a positive minimum, double a negative one, or
+/// an unconstrained `-maxRate` on a fresh curve.
+fn rate_min_value_after(data: &[Real], valid_data: bool) -> Real {
+    if valid_data {
+        let r = data.iter().copied().fold(Real::INFINITY, Real::min);
+        return if r < 0.0 { r * 2.0 } else { r / 2.0 };
+    }
+    -MAX_RATE
+}
+
+/// The upper bracket the rate-storing conventions share (`maxValueAfter`,
+/// `:180-193`/`:279-292`): double a positive maximum, half a negative one, or
+/// an unconstrained `+maxRate` on a fresh curve.
+fn rate_max_value_after(data: &[Real], valid_data: bool) -> Real {
+    if valid_data {
+        let r = data.iter().copied().fold(Real::NEG_INFINITY, Real::max);
+        return if r < 0.0 { r / 2.0 } else { r * 2.0 };
+    }
+    MAX_RATE
+}
+
+/// The solved-value write the rate-storing conventions share (`updateGuess`,
+/// `:207-214`/`:306-313`): node `i` takes the rate, and the reference node
+/// mirrors the first pillar so the `(0, t1)` segment is not left at
+/// `initial_value`.
+fn rate_update_guess(data: &mut [Real], value: Real, i: Size) {
+    data[i] = value;
+    if i == 1 {
+        data[0] = value;
+    }
+}
+
+/// Zero-yield bootstrap traits (`struct ZeroYield`, `bootstraptraits.hpp:127`).
+/// The curve nodes are continuously compounded zero rates; the reference node
+/// starts at the average rate and the bracket keeps each rate within
+/// `[-maxRate, maxRate]` on a fresh pass.
+pub struct ZeroYield;
+
+impl BootstrapTraits for ZeroYield {
+    fn initial_value() -> Real {
+        AVG_RATE
+    }
+
+    fn guess(i: Size, _times: &[Time], data: &[Real], valid_data: bool) -> Real {
+        rate_guess(i, data, valid_data)
+    }
+
+    fn min_value_after(_i: Size, _times: &[Time], data: &[Real], valid_data: bool) -> Real {
+        rate_min_value_after(data, valid_data)
+    }
+
+    fn max_value_after(_i: Size, _times: &[Time], data: &[Real], valid_data: bool) -> Real {
+        rate_max_value_after(data, valid_data)
+    }
+
+    fn update_guess(data: &mut [Real], value: Real, i: Size) {
+        rate_update_guess(data, value, i);
+    }
+
+    fn max_iterations() -> Size {
+        100
+    }
+}
+
+impl YieldBootstrapTraits for ZeroYield {
+    /// The node is a zero rate `z(t)`, so the discount factor is `exp(-z*t)`.
+    /// In range the rate is the interpolated value; past the last solved node
+    /// the last instantaneous forward continues flat, mirroring
+    /// `InterpolatedZeroCurve::zeroYieldImpl` (`zerocurve.rs:164-182`).
+    fn discount_from_nodes<I: Interpolation>(
+        interpolation: &I,
+        t: Time,
+    ) -> QlResult<DiscountFactor> {
+        let t_max = interpolation.x_max();
+        let z = if t <= t_max {
+            interpolation.value(t)?
+        } else {
+            let z_max = interpolation.value(t_max)?;
+            let inst_fwd_max = z_max + t_max * interpolation.derivative(t_max)?;
+            (z_max * t_max + inst_fwd_max * (t - t_max)) / t
+        };
+        Ok((-z * t).exp())
+    }
+}
+
+/// Forward-rate bootstrap traits (`struct ForwardRate`,
+/// `bootstraptraits.hpp:220`). The curve nodes are instantaneous forward rates;
+/// the guess, bracket and update are identical to [`ZeroYield`] (both store
+/// rates), and only the node-to-discount conversion differs - it integrates the
+/// forward instead of scaling a zero rate.
+pub struct ForwardRate;
+
+impl BootstrapTraits for ForwardRate {
+    fn initial_value() -> Real {
+        AVG_RATE
+    }
+
+    fn guess(i: Size, _times: &[Time], data: &[Real], valid_data: bool) -> Real {
+        rate_guess(i, data, valid_data)
+    }
+
+    fn min_value_after(_i: Size, _times: &[Time], data: &[Real], valid_data: bool) -> Real {
+        rate_min_value_after(data, valid_data)
+    }
+
+    fn max_value_after(_i: Size, _times: &[Time], data: &[Real], valid_data: bool) -> Real {
+        rate_max_value_after(data, valid_data)
+    }
+
+    fn update_guess(data: &mut [Real], value: Real, i: Size) {
+        rate_update_guess(data, value, i);
+    }
+
+    fn max_iterations() -> Size {
+        100
+    }
+}
+
+impl YieldBootstrapTraits for ForwardRate {
+    /// The node is an instantaneous forward `f(t)`, so the discount factor is
+    /// `exp(-int_0^t f)`. The interpolation's antiderivative gives the integral
+    /// in range; past the last solved node the forward continues flat, mirroring
+    /// `InterpolatedForwardCurve::zeroYieldImpl` (`forwardcurve.rs:169-183`).
+    /// At `t = 0` the antiderivative is zero, so the factor is 1 with no special
+    /// case. `LogLinear` has no closed-form primitive and errors here, which is
+    /// why `ForwardRate` is only wired with `Linear`/`BackwardFlat`.
+    fn discount_from_nodes<I: Interpolation>(
+        interpolation: &I,
+        t: Time,
+    ) -> QlResult<DiscountFactor> {
+        let t_max = interpolation.x_max();
+        let integral = if t <= t_max {
+            interpolation.primitive(t)?
+        } else {
+            let last_forward = interpolation.value(t_max)?;
+            interpolation.primitive(t_max)? + last_forward * (t - t_max)
+        };
+        Ok((-integral).exp())
+    }
+}
+
+/// The `-1/t + 1e-8` rate floor `SimpleZeroYield` shares between its lower
+/// bracket (`bootstraptraits.hpp:366`) and its optimizer transforms
+/// (`:385-393`). A simply compounded rate at `z = -1/t` sends the discount
+/// factor `1/(1 + z*t)` through a pole, so every admissible node sits strictly
+/// above it and the `1e-8` is the margin that keeps it strict.
+fn simple_zero_floor(t: Time) -> Real {
+    -1.0 / t + 1e-8
+}
+
+/// Simply compounded zero-yield bootstrap traits (`struct SimpleZeroYield`,
+/// `bootstraptraits.hpp:313`). The nodes are zero rates like [`ZeroYield`]'s,
+/// but read with `Simple` compounding, so the node-to-discount conversion is
+/// `1/(1 + z*t)` rather than `exp(-z*t)`. The pole that conversion has at
+/// `z = -1/t` is the whole difference in the traits: the guess, bracket and
+/// update are the shared rate forms, with the lower bracket and both
+/// transforms shifted up by the shared `simple_zero_floor` to keep every trial
+/// node on the admissible side of it.
+pub struct SimpleZeroYield;
+
+impl BootstrapTraits for SimpleZeroYield {
+    fn initial_value() -> Real {
+        AVG_RATE
+    }
+
+    fn guess(i: Size, _times: &[Time], data: &[Real], valid_data: bool) -> Real {
+        rate_guess(i, data, valid_data)
+    }
+
+    /// The shared rate bracket floored at `simple_zero_floor`
+    /// (`bootstraptraits.hpp:352-367`). The `max` is applied to both branches,
+    /// after the if/else, exactly as upstream: on a fresh pass it raises the
+    /// unconstrained `-maxRate` for every node past `t = 1`, and on a reused
+    /// solution it raises a doubled negative minimum.
+    fn min_value_after(i: Size, times: &[Time], data: &[Real], valid_data: bool) -> Real {
+        rate_min_value_after(data, valid_data).max(simple_zero_floor(times[i]))
+    }
+
+    /// The shared rate bracket unchanged (`bootstraptraits.hpp:369-381`): the
+    /// pole is below every admissible rate, so only the lower bound moves.
+    fn max_value_after(_i: Size, _times: &[Time], data: &[Real], valid_data: bool) -> Real {
+        rate_max_value_after(data, valid_data)
+    }
+
+    fn update_guess(data: &mut [Real], value: Real, i: Size) {
+        rate_update_guess(data, value, i);
+    }
+
+    fn max_iterations() -> Size {
+        100
+    }
+}
+
+impl YieldBootstrapTraits for SimpleZeroYield {
+    /// The node is a simply compounded zero rate `z(t)`, so the discount
+    /// factor is `1/(1 + z*t)` (`interpolatedsimplezerocurve.hpp:114-129`).
+    /// The rate itself is read exactly as [`ZeroYield`] reads it - interpolated
+    /// in range, the last instantaneous forward continued flat past the last
+    /// solved node - and only the final conversion differs.
+    fn discount_from_nodes<I: Interpolation>(
+        interpolation: &I,
+        t: Time,
+    ) -> QlResult<DiscountFactor> {
+        let t_max = interpolation.x_max();
+        let z = if t <= t_max {
+            interpolation.value(t)?
+        } else {
+            let z_max = interpolation.value(t_max)?;
+            let inst_fwd_max = z_max + t_max * interpolation.derivative(t_max)?;
+            (z_max * t_max + inst_fwd_max * (t - t_max)) / t
+        };
+        Ok(1.0 / (1.0 + z * t))
+    }
+
+    /// `exp(x) + (-1/t + 1e-8)` (`bootstraptraits.hpp:385-388`): the `Discount`
+    /// exponential shifted onto the admissible half-line, so the optimizer's
+    /// image is exactly `(simple_zero_floor(t), inf)`.
+    fn transform_direct(x: Real, t: Time) -> Real {
+        x.exp() + simple_zero_floor(t)
+    }
+
+    /// `log(x - (-1/t + 1e-8))` (`bootstraptraits.hpp:389-393`).
+    fn transform_inverse(x: Real, t: Time) -> Real {
+        (x - simple_zero_floor(t)).ln()
+    }
+}
+
+/// Mutable node storage of a piecewise curve: the pillar dates and times, the
+/// solved values (discount factors for `Discount`), and the interpolation
+/// rebuilt over the solved prefix.
+///
+/// This is the curve-side half of the mutation decision. The bootstrap holds
+/// it through a `RefCell` on the curve and drives it a node at a time; the
+/// curve's discount lookup reads it back through
+/// [`interpolation`](Self::interpolation), handing that to the convention's
+/// [`discount_from_nodes`](YieldBootstrapTraits::discount_from_nodes). During a
+/// bootstrap the interpolation only spans the solved prefix `[0, upto]`, so
+/// that conversion extrapolates past the last solved node with a flat
+/// instantaneous forward - which is also why a helper for pillar `i` (whose
+/// latest relevant date is at most `times[i]`) only ever reads in-range values.
+pub struct CurveData<I: Interpolator> {
+    dates: Vec<Date>,
+    times: Vec<Time>,
+    data: Vec<Real>,
+    interpolation: Option<I::Output>,
+    max_date: Option<Date>,
+    valid: bool,
+}
+
+impl<I: Interpolator> Default for CurveData<I> {
+    fn default() -> Self {
+        CurveData::new()
+    }
+}
+
+impl<I: Interpolator> CurveData<I> {
+    /// An empty, un-bootstrapped holder (the curve is built cheap; the nodes
+    /// are filled lazily on the first calculation).
+    pub fn new() -> CurveData<I> {
+        CurveData {
+            dates: Vec::new(),
+            times: Vec::new(),
+            data: Vec::new(),
+            interpolation: None,
+            max_date: None,
+            valid: false,
+        }
+    }
+
+    /// Whether a previous bootstrap left a usable solution to seed the next one
+    /// (C++'s `validCurve_`).
+    pub fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    /// Marks the current node values as a usable solution.
+    pub fn set_valid(&mut self, valid: bool) {
+        self.valid = valid;
+    }
+
+    /// Installs the pillar dates and times for a bootstrap pass. The value
+    /// vector is left untouched so a valid previous solution can seed the next
+    /// pass; [`reset_data`](Self::reset_data) clears it when it cannot.
+    pub fn set_pillars(&mut self, dates: Vec<Date>, times: Vec<Time>) {
+        self.dates = dates;
+        self.times = times;
+        self.interpolation = None;
+    }
+
+    /// Resets every node to `initial_value` (C++'s `data_ =
+    /// vector(alive+1, initialValue)`), discarding any prior solution.
+    pub fn reset_data(&mut self, initial_value: Real, len: usize) {
+        self.data = vec![initial_value; len];
+        self.valid = false;
+    }
+
+    /// The pillar dates.
+    pub fn dates(&self) -> &[Date] {
+        &self.dates
+    }
+
+    /// The pillar times.
+    pub fn times(&self) -> &[Time] {
+        &self.times
+    }
+
+    /// The node values.
+    pub fn data(&self) -> &[Real] {
+        &self.data
+    }
+
+    /// Mutable access to the node values, for the traits' `update_guess`.
+    pub fn data_mut(&mut self) -> &mut [Real] {
+        &mut self.data
+    }
+
+    /// The curve's maximum date (the latest relevant date over all helpers).
+    pub fn max_date(&self) -> Option<Date> {
+        self.max_date
+    }
+
+    /// Records the curve's maximum date.
+    pub fn set_max_date(&mut self, date: Date) {
+        self.max_date = Some(date);
+    }
+
+    /// Whether the nodes have been laid out (a bootstrap has at least started).
+    pub fn is_initialized(&self) -> bool {
+        !self.times.is_empty()
+    }
+
+    /// The (date, value) nodes.
+    pub fn nodes(&self) -> Vec<(Date, Real)> {
+        self.dates
+            .iter()
+            .copied()
+            .zip(self.data.iter().copied())
+            .collect()
+    }
+
+    /// Rebuilds the interpolation over the solved prefix `[0, upto]`
+    /// (C++'s `interpolateWithoutUpdate(..., times.begin()+upto+1, ...)`).
+    pub fn rebuild(&mut self, interpolator: &I, upto: usize) -> QlResult<()> {
+        self.interpolation =
+            Some(interpolator.interpolate(&self.times[..=upto], &self.data[..=upto])?);
+        Ok(())
+    }
+
+    /// Replaces the interpolation wholesale (C++'s `ts_->interpolation_ =
+    /// ...` assignment in `LocalBootstrap::calculate`), for a bootstrap that
+    /// builds each interpolation itself - through
+    /// [`LocalInterpolator::local_interpolate`](crate::math::interpolations::LocalInterpolator::local_interpolate) -
+    /// rather than through [`rebuild`](Self::rebuild).
+    pub fn set_interpolation(&mut self, interpolation: I::Output) {
+        self.interpolation = Some(interpolation);
+    }
+
+    /// The interpolation rebuilt over the solved prefix, for a trait's
+    /// [`discount_from_nodes`](YieldBootstrapTraits::discount_from_nodes) to read the
+    /// node value, derivative or antiderivative at a time. Errors before the
+    /// bootstrap has laid one down.
+    pub fn interpolation(&self) -> QlResult<&I::Output> {
+        match self.interpolation.as_ref() {
+            Some(interpolation) => Ok(interpolation),
+            None => fail!("curve not bootstrapped: no interpolation available"),
+        }
+    }
+
+    /// Asserts the holder has been bootstrapped, for inspectors that must not
+    /// hand back an empty curve.
+    pub fn require_initialized(&self) -> QlResult<()> {
+        require!(self.is_initialized(), "curve not bootstrapped");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::interpolations::loglinear::LogLinear;
+
+    #[test]
+    fn discount_initial_value_is_one() {
+        assert_eq!(Discount::initial_value(), 1.0);
+    }
+
+    #[test]
+    fn first_pillar_guess_uses_the_average_rate() {
+        let times = [0.0, 0.5];
+        let data = [1.0, 1.0];
+        let guess = Discount::guess(1, &times, &data, false);
+        assert!((guess - 1.0 / (1.0 + AVG_RATE * 0.5)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn later_pillar_guess_extrapolates_the_previous_forward_flat() {
+        // node 1 at t=0.5 with df 0.98 -> r = -ln(0.98)/0.5; node 2 at t=1.0
+        // guesses exp(-r*1.0).
+        let times = [0.0, 0.5, 1.0];
+        let data = [1.0, 0.98, 1.0];
+        let r = -0.98_f64.ln() / 0.5;
+        let guess = Discount::guess(2, &times, &data, false);
+        assert!((guess - (-r * 1.0).exp()).abs() < 1e-15);
+    }
+
+    #[test]
+    fn valid_data_guess_reuses_the_stored_node() {
+        let times = [0.0, 0.5, 1.0];
+        let data = [1.0, 0.98, 0.95];
+        assert_eq!(Discount::guess(2, &times, &data, true), 0.95);
+    }
+
+    #[test]
+    fn bracket_bounds_a_max_rate_forward_around_the_previous_node() {
+        let times = [0.0, 0.5, 1.0];
+        let data = [1.0, 0.98, 1.0];
+        let dt = 0.5;
+        let min = Discount::min_value_after(2, &times, &data, false);
+        let max = Discount::max_value_after(2, &times, &data, false);
+        assert!((min - 0.98 * (-MAX_RATE * dt).exp()).abs() < 1e-15);
+        assert!((max - 0.98 * (MAX_RATE * dt).exp()).abs() < 1e-15);
+        assert!(min < max);
+    }
+
+    #[test]
+    fn valid_data_min_halves_the_smallest_node() {
+        let times = [0.0, 0.5, 1.0];
+        let data = [1.0, 0.98, 0.90];
+        let min = Discount::min_value_after(2, &times, &data, true);
+        assert!((min - 0.90 / 2.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn update_guess_writes_the_node() {
+        let mut data = [1.0, 0.98, 1.0];
+        Discount::update_guess(&mut data, 0.95, 2);
+        assert_eq!(data[2], 0.95);
+    }
+
+    /// The `Discount` optimizer transforms are `exp`/`log`
+    /// (`bootstraptraits.hpp:106-113`): a mutually inverse pair whose direct
+    /// image is always a positive discount factor, and which ignores the node
+    /// time the signature now threads.
+    #[test]
+    fn discount_transforms_are_exp_and_log() {
+        assert_eq!(Discount::transform_direct(0.0, 1.0), 1.0);
+        let df = 0.97;
+        assert_eq!(Discount::transform_inverse(df, 1.0), df.ln());
+        let x = Discount::transform_inverse(df, 1.0);
+        assert!((Discount::transform_direct(x, 1.0) - df).abs() < 1e-15);
+        assert!(Discount::transform_direct(-40.0, 1.0) > 0.0);
+        assert_eq!(
+            Discount::transform_direct(0.5, 0.25),
+            Discount::transform_direct(0.5, 30.0)
+        );
+        assert_eq!(
+            Discount::transform_inverse(df, 0.25),
+            Discount::transform_inverse(df, 30.0)
+        );
+    }
+
+    /// The rate-storing conventions keep the default identity transforms
+    /// (`bootstraptraits.hpp:197-204` for `ZeroYield`, `:290-295` for
+    /// `ForwardRate`), node time included.
+    #[test]
+    fn rate_convention_transforms_are_identity() {
+        assert_eq!(ZeroYield::transform_direct(0.05, 1.0), 0.05);
+        assert_eq!(ZeroYield::transform_inverse(-0.01, 1.0), -0.01);
+        assert_eq!(ForwardRate::transform_direct(0.05, 1.0), 0.05);
+        assert_eq!(ForwardRate::transform_inverse(-0.01, 1.0), -0.01);
+        assert_eq!(
+            ZeroYield::transform_direct(0.05, 0.25),
+            ZeroYield::transform_direct(0.05, 30.0)
+        );
+        assert_eq!(
+            ForwardRate::transform_inverse(-0.01, 0.25),
+            ForwardRate::transform_inverse(-0.01, 30.0)
+        );
+    }
+
+    /// `SimpleZeroYield`'s transforms are the `Discount` exp/log pair shifted
+    /// by the node-time floor `-1/t + 1e-8` (`bootstraptraits.hpp:385-393`),
+    /// so the optimizer's image is exactly the admissible half-line
+    /// `(-1/t + 1e-8, inf)`.
+    ///
+    /// What each half of this test can see: the round trip alone is VACUOUS
+    /// about the constant, because `inverse(direct(x, t), t) == x` holds for
+    /// any shared shift - a dropped `1e-8`, a flipped sign, `1/t` for `-1/t`
+    /// all survive it. The literal value pins are what discriminate those, and
+    /// they are transcription pins, not behavioural ones: the end-to-end
+    /// global-solve oracle for the transform is #976's `testGlobalBootstrap`,
+    /// the only upstream test that runs `SimpleZeroYield` under
+    /// `GlobalBootstrap`.
+    #[test]
+    fn simple_zero_transforms_shift_exp_log_by_the_node_floor() {
+        for t in [0.25, 1.0, 2.0, 30.0] {
+            for x in [-3.0, -0.5, 0.0, 1.5] {
+                let round =
+                    SimpleZeroYield::transform_inverse(SimpleZeroYield::transform_direct(x, t), t);
+                assert!((round - x).abs() < 1e-12, "t {t}, x {x}: got {round}");
+            }
+        }
+
+        // exp(0) = 1 shifted by the floor, at two node times so a transform
+        // ignoring `t` cannot pass both
+        assert!((SimpleZeroYield::transform_direct(0.0, 2.0) - 0.50000001).abs() < 1e-15);
+        assert!((SimpleZeroYield::transform_direct(0.0, 0.25) - -2.99999999).abs() < 1e-15);
+        assert!((SimpleZeroYield::transform_inverse(2.0, 4.0) - 2.24999999_f64.ln()).abs() < 1e-15);
+    }
+
+    /// `SimpleZeroYield::minValueAfter` floors the shared rate bracket at
+    /// `-1/t + 1e-8` (`bootstraptraits.hpp:352-367`) in BOTH branches, and
+    /// `maxValueAfter` (`:369-381`) is unfloored.
+    #[test]
+    fn simple_zero_bracket_floors_only_its_lower_bound() {
+        let times = [0.0, 0.5, 2.0];
+
+        // fresh curve: the floor beats -maxRate at t = 2 and loses at t = 0.5
+        let fresh = [AVG_RATE; 3];
+        assert!(
+            (SimpleZeroYield::min_value_after(2, &times, &fresh, false) - -0.49999999).abs()
+                < 1e-15
+        );
+        assert_eq!(
+            SimpleZeroYield::min_value_after(1, &times, &fresh, false),
+            -MAX_RATE
+        );
+
+        // reused solution: the floor still applies after the if/else, so a
+        // doubled negative minimum below it is raised, and one above it is not
+        let deep = [-0.3, -0.3, -0.3];
+        assert!(
+            (SimpleZeroYield::min_value_after(2, &times, &deep, true) - -0.49999999).abs() < 1e-15
+        );
+        let shallow = [0.04, 0.05, 0.06];
+        assert!((SimpleZeroYield::min_value_after(2, &times, &shallow, true) - 0.02).abs() < 1e-15);
+
+        // the upper bound is never floored: -1.2/2 stays below the floor
+        let negative = [-1.2, -1.2, -1.2];
+        assert!(
+            (SimpleZeroYield::max_value_after(2, &times, &negative, true) - -0.6).abs() < 1e-15
+        );
+        assert_eq!(
+            SimpleZeroYield::max_value_after(2, &times, &fresh, false),
+            MAX_RATE
+        );
+        assert_eq!(SimpleZeroYield::initial_value(), AVG_RATE);
+        assert_eq!(SimpleZeroYield::max_iterations(), 100);
+    }
+
+    #[test]
+    fn curve_data_discount_interpolates_in_range_and_extends_flat_beyond() {
+        let mut cd = CurveData::<LogLinear>::new();
+        cd.set_pillars(
+            vec![Date::null(), Date::null(), Date::null()],
+            vec![0.0, 1.0, 2.0],
+        );
+        cd.reset_data(1.0, 3);
+        cd.data_mut()[1] = 0.95;
+        cd.data_mut()[2] = 0.88;
+        cd.rebuild(&LogLinear, 2).unwrap();
+
+        // in range: geometric interpolation of log-linear discounts
+        let mid = Discount::discount_from_nodes(cd.interpolation().unwrap(), 1.5).unwrap();
+        assert!((mid - (0.95_f64 * 0.88).sqrt()).abs() < 1e-12);
+
+        // past the last node: flat instantaneous forward continues
+        let last_forward = (0.95_f64 / 0.88).ln();
+        let beyond = Discount::discount_from_nodes(cd.interpolation().unwrap(), 3.0).unwrap();
+        assert!((beyond - 0.88 * (-last_forward * 1.0).exp()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn curve_data_interpolation_before_bootstrap_is_an_error() {
+        let cd = CurveData::<LogLinear>::new();
+        assert!(cd.interpolation().is_err());
+        assert!(cd.require_initialized().is_err());
+    }
+}

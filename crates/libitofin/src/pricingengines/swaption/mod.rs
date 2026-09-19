@@ -1,0 +1,22 @@
+//! Swaption pricing engines.
+//!
+//! Port of `ql/pricingengines/swaption/`: the shared
+//! [`BlackStyleSwaptionEngine`] template with its shifted-lognormal
+//! ([`BlackSwaptionEngine`]) and normal ([`BachelierSwaptionEngine`])
+//! instantiations, plus the model-based [`JamshidianSwaptionEngine`] (European
+//! swaption pricing under Hull-White via the Jamshidian decomposition).
+
+mod blackswaptionengine;
+mod discretizedswap;
+mod discretizedswaption;
+mod jamshidianswaptionengine;
+mod treeswaptionengine;
+
+pub use blackswaptionengine::{
+    BachelierSpec, BachelierSwaptionEngine, Black76Spec, BlackStyleSpec, BlackStyleSwaptionEngine,
+    BlackSwaptionEngine, CashAnnuityModel,
+};
+pub use discretizedswap::DiscretizedSwap;
+pub use discretizedswaption::DiscretizedSwaption;
+pub use jamshidianswaptionengine::JamshidianSwaptionEngine;
+pub use treeswaptionengine::TreeSwaptionEngine;

@@ -1,0 +1,151 @@
+//! Interpolation framework and concrete interpolations from `ql/math/interpolations/`.
+
+pub mod backwardflatlinear;
+pub mod bicubic;
+pub mod bilinear;
+pub mod convexmonotone;
+pub mod cubic;
+pub mod flat;
+pub mod flatextrapolator2d;
+pub mod linear;
+pub mod loglinear;
+pub mod sabrinterpolation;
+
+use crate::errors::QlResult;
+use crate::types::{Real, Size};
+
+/// A one-dimensional interpolation over sorted `x` nodes.
+///
+/// Mirrors the evaluation surface of QuantLib's `Interpolation`: the value, its
+/// derivative, and its antiderivative (`primitive`), each validated against the
+/// domain, plus the domain bounds.
+pub trait Interpolation {
+    /// The interpolated value at `x`. Errors if `x` is outside `[x_min, x_max]`
+    /// and extrapolation is disabled.
+    fn value(&self, x: Real) -> QlResult<Real>;
+
+    /// The first derivative at `x`.
+    fn derivative(&self, x: Real) -> QlResult<Real>;
+
+    /// The antiderivative (integral from `x_min`) at `x`.
+    fn primitive(&self, x: Real) -> QlResult<Real>;
+
+    /// The lower end of the interpolation domain.
+    fn x_min(&self) -> Real;
+
+    /// The upper end of the interpolation domain.
+    fn x_max(&self) -> Real;
+
+    /// Whether `x` lies within `[x_min, x_max]`.
+    fn is_in_range(&self, x: Real) -> bool;
+}
+
+/// A factory building an [`Interpolation`] over `(x, y)` nodes.
+///
+/// Mirrors QuantLib's interpolator traits classes (`Linear`, `LogLinear`,
+/// ...): term structures store the factory alongside their node data and
+/// rebuild the interpolation from it whenever the data changes.
+pub trait Interpolator {
+    /// The interpolation type this factory builds.
+    type Output: Interpolation;
+
+    /// Whether this is a global interpolator: every interpolated value depends
+    /// on all node values, so moving one node re-shapes the whole curve.
+    ///
+    /// Mirrors QuantLib's `Interpolator::global`. A single-pass bootstrap solves
+    /// each node once against the curve built so far, which cannot converge a
+    /// global interpolator (an earlier node's value shifts once later nodes are
+    /// added). Local interpolators (`Linear`, `LogLinear`, `BackwardFlat`) leave
+    /// this `false`; `Cubic` overrides it to `true`.
+    const GLOBAL: bool = false;
+
+    /// Builds an interpolation through `(x, y)`.
+    fn interpolate(&self, x: &[Real], y: &[Real]) -> QlResult<Self::Output>;
+
+    /// The minimum number of nodes the interpolation requires.
+    fn required_points(&self) -> Size {
+        2
+    }
+}
+
+/// An [`Interpolator`] that additionally supports the incremental build of
+/// QuantLib's `LocalBootstrap` (a `localInterpolate` method plus the
+/// `dataSizeAdjustment` constant).
+///
+/// C++ constrains `LocalBootstrap` to such interpolators structurally: the
+/// template only compiles against a traits class that has both members. This
+/// trait is the Rust spelling of that constraint - `LocalBootstrap`'s
+/// [`Bootstrap`](crate::termstructures::iterativebootstrap::Bootstrap) impl
+/// requires it, so a curve wired with any other interpolator fails to compile
+/// rather than erroring at runtime. Only
+/// [`ConvexMonotone`](convexmonotone::ConvexMonotone) implements it.
+pub trait LocalInterpolator: Interpolator {
+    /// The number of curve nodes the bootstrap's solver vector is shortened by
+    /// (QuantLib's `dataSizeAdjustment`): 1 for the convex-monotone method,
+    /// whose interpolation ignores the first data point.
+    const DATA_SIZE_ADJUSTMENT: usize = 0;
+
+    /// Grows the interpolation one node at a time (QuantLib's
+    /// `localInterpolate`): builds over the `(x, y)` prefix, reusing the seam
+    /// state of `prev` (the previous step's interpolation, required past the
+    /// first localisation window) and covering the remaining span up to
+    /// `final_size` nodes with the method's boundary approximation.
+    fn local_interpolate(
+        &self,
+        x: &[Real],
+        y: &[Real],
+        localisation: usize,
+        prev: Option<&Self::Output>,
+        final_size: usize,
+    ) -> QlResult<Self::Output>;
+}
+
+/// A two-dimensional interpolation over sorted `x` and `y` node grids and a
+/// tabulated `z` matrix, where `z[j][i]` is the value at `(x[i], y[j])`.
+///
+/// Mirrors the evaluation surface of QuantLib's `Interpolation2D`: the value at
+/// a point plus the rectangular domain bounds. Like the 1-D
+/// [`Interpolation`] trait, `is_in_range` uses plain interval
+/// comparisons (QuantLib additionally widens the boundary by `close`).
+pub trait Interpolation2D {
+    /// The interpolated value at `(x, y)`. Errors if the point is outside the
+    /// domain and extrapolation is disabled.
+    fn value(&self, x: Real, y: Real) -> QlResult<Real>;
+
+    /// The lower end of the `x` domain.
+    fn x_min(&self) -> Real;
+
+    /// The upper end of the `x` domain.
+    fn x_max(&self) -> Real;
+
+    /// The lower end of the `y` domain.
+    fn y_min(&self) -> Real;
+
+    /// The upper end of the `y` domain.
+    fn y_max(&self) -> Real;
+
+    /// Whether `(x, y)` lies within `[x_min, x_max] x [y_min, y_max]`.
+    fn is_in_range(&self, x: Real, y: Real) -> bool;
+
+    /// Sets whether evaluation outside the domain is permitted (extending
+    /// the boundary cells) rather than an error.
+    ///
+    /// QuantLib passes the flag on every call (`operator()(x, y, true)`);
+    /// this port carries it on the object, so holders that always
+    /// extrapolate (a variance surface, say) flip it once after building.
+    fn set_extrapolation(&mut self, allow: bool);
+}
+
+/// A factory building an [`Interpolation2D`] over grid nodes.
+///
+/// Mirrors QuantLib's 2-D interpolator traits classes (`Bilinear`,
+/// `Bicubic`): term structures store the factory alongside their grid data
+/// and rebuild the interpolation from it whenever the data changes.
+pub trait Interpolator2D {
+    /// The interpolation type this factory builds.
+    type Output: Interpolation2D;
+
+    /// Builds an interpolation over the grid `(x, y)` with values `z`, where
+    /// `z[j][i]` is the value at `(x[i], y[j])`.
+    fn interpolate(&self, x: Vec<Real>, y: Vec<Real>, z: Vec<Vec<Real>>) -> QlResult<Self::Output>;
+}

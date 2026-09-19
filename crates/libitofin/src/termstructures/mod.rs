@@ -1,0 +1,631 @@
+//! Term-structure base machinery.
+//!
+//! Port of `ql/termstructure.{hpp,cpp}`: the [`TermStructure`] trait is the
+//! curve contract (C++'s virtual interface) and [`TermStructureBase`] is the
+//! shared holder concrete curves embed (C++'s data members and default
+//! behaviour). A term structure keeps track of its reference date in one of
+//! three ways: a fixed date, a date moving off the evaluation date (advanced
+//! by a number of settlement days on a calendar), or a date managed by the
+//! concrete curve itself (which then overrides
+//! [`reference_date`](TermStructure::reference_date)).
+//!
+//! ## Divergences from QuantLib
+//!
+//! - QuantLib's moving mode reads the global `Settings` singleton; per D5 the
+//!   moving constructor takes the shared [`Settings`] handle explicitly and
+//!   registers with its evaluation-date observable. The date mutates through
+//!   `&self`, so an observer may read the reference date back while the
+//!   evaluation-date notification that invalidated it is still running.
+//! - A base asked for a reference date it does not manage returns an `Err`
+//!   where C++ silently returns the null date.
+//! - C++'s `Extrapolator` base class is folded into the holder as a flag; it
+//!   can be extracted once the interpolation layer needs it.
+//! - The empty `Calendar`/`DayCounter` states are `Option`s here, per the
+//!   [`DayCounter`] port convention.
+//! - No today's-date fallback: C++ resolves an unset evaluation date to
+//!   `Date::todaysDate()`; this port has no system-clock date, so a moving
+//!   structure returns an `Err` until the evaluation date is set explicitly.
+//! - The moving recompute reads the constructor-stored calendar and
+//!   settlement days; a curve overriding
+//!   [`calendar`](TermStructure::calendar) or
+//!   [`settlement_days`](TermStructure::settlement_days) (C++ dispatches
+//!   through the virtuals) must override
+//!   [`reference_date`](TermStructure::reference_date) as well.
+
+pub mod bootstraphelper;
+pub mod bootstraptraits;
+pub mod credit;
+pub mod globalbootstrap;
+pub mod globalbootstrapvars;
+pub mod inflation;
+pub mod interpolatedcurve;
+pub mod iterativebootstrap;
+pub mod localbootstrap;
+pub mod multicurve;
+pub mod volatility;
+pub mod yields;
+pub mod yieldtermstructure;
+
+pub use bootstraphelper::{
+    BootstrapHelperBase, BootstrapHelperShared, RateHelper, RelativeDateRateHelper,
+    compare_by_pillar_date, sort_by_pillar_date,
+};
+pub use multicurve::MultiCurve;
+
+use std::cell::Cell;
+
+use crate::errors::QlResult;
+use crate::math::comparison::close_enough;
+use crate::patterns::observable::{AsObservable, Observable, Observer, ResetThenNotify};
+use crate::settings::Settings;
+use crate::shared::{Shared, SharedMut, shared};
+use crate::time::businessdayconvention::BusinessDayConvention;
+use crate::time::calendar::Calendar;
+use crate::time::date::Date;
+use crate::time::daycounter::DayCounter;
+use crate::time::timeunit::TimeUnit;
+use crate::types::{Integer, Natural, Time};
+use crate::{fail, require};
+
+/// The lazily recomputed reference date shared between the holder and its
+/// observer half (C++'s `mutable referenceDate_`/`updated_`/`moving_`;
+/// `None` means stale for a moving structure and unmanaged otherwise).
+struct ReferenceState {
+    date: Cell<Option<Date>>,
+    moving: bool,
+}
+
+/// Shared base holder for term structures.
+///
+/// Concrete curves embed one, delegate the [`TermStructure`] trait's
+/// `base()` accessor to it, and expose its [`observable`](Self::observable)
+/// through [`AsObservable`].
+pub struct TermStructureBase {
+    calendar: Option<Calendar>,
+    settlement_days: Option<Natural>,
+    day_counter: Option<DayCounter>,
+    settings: Option<Shared<Settings<Date>>>,
+    extrapolation: Cell<bool>,
+    reference: Shared<ReferenceState>,
+    observable: Shared<Observable>,
+    updater: SharedMut<ResetThenNotify>,
+}
+
+impl TermStructureBase {
+    fn assemble(
+        calendar: Option<Calendar>,
+        settlement_days: Option<Natural>,
+        day_counter: Option<DayCounter>,
+        settings: Option<Shared<Settings<Date>>>,
+        moving: bool,
+        reference_date: Option<Date>,
+    ) -> TermStructureBase {
+        let reference = shared(ReferenceState {
+            date: Cell::new(reference_date),
+            moving,
+        });
+        let observable = shared(Observable::new());
+        let updater = ResetThenNotify::broadcasting(Shared::clone(&observable), {
+            let reference = Shared::clone(&reference);
+            move || {
+                if reference.moving {
+                    reference.date.set(None);
+                }
+            }
+        });
+        TermStructureBase {
+            calendar,
+            settlement_days,
+            day_counter,
+            settings,
+            extrapolation: Cell::new(false),
+            reference,
+            observable,
+            updater,
+        }
+    }
+
+    /// Base for a curve that manages its own reference date by overriding
+    /// [`TermStructure::reference_date`] (C++'s default constructor).
+    pub fn new(day_counter: Option<DayCounter>) -> TermStructureBase {
+        Self::assemble(None, None, day_counter, None, false, None)
+    }
+
+    /// Base with a fixed reference date.
+    pub fn with_reference_date(
+        reference_date: Date,
+        calendar: Option<Calendar>,
+        day_counter: Option<DayCounter>,
+    ) -> TermStructureBase {
+        Self::assemble(
+            calendar,
+            None,
+            day_counter,
+            None,
+            false,
+            Some(reference_date),
+        )
+    }
+
+    /// Base whose reference date moves off the evaluation date, advanced by
+    /// `settlement_days` business days on `calendar`.
+    ///
+    /// Registers with the settings' evaluation-date observable: a date change
+    /// invalidates the cached reference date and notifies the structure's
+    /// observers.
+    pub fn moving(
+        settlement_days: Natural,
+        calendar: Calendar,
+        day_counter: Option<DayCounter>,
+        settings: Shared<Settings<Date>>,
+    ) -> TermStructureBase {
+        let base = Self::assemble(
+            Some(calendar),
+            Some(settlement_days),
+            day_counter,
+            Some(Shared::clone(&settings)),
+            true,
+            None,
+        );
+        settings.register_eval_date_observer(&(base.updater.clone() as SharedMut<dyn Observer>));
+        base
+    }
+
+    /// The date at which discount = 1.0 and/or variance = 0.0, recomputing it
+    /// off the evaluation date first when the structure is moving.
+    pub fn reference_date(&self) -> QlResult<Date> {
+        if self.reference.moving && self.reference.date.get().is_none() {
+            let settings = self
+                .settings
+                .as_ref()
+                .expect("a moving term structure holds settings");
+            let Some(today) = settings.evaluation_date() else {
+                fail!("no evaluation date set: a moving term structure needs one");
+            };
+            require!(
+                today != Date::null(),
+                "null evaluation date set for a moving term structure"
+            );
+            let days = self
+                .settlement_days
+                .expect("a moving term structure holds settlement days");
+            let Ok(n) = Integer::try_from(days) else {
+                fail!("settlement days ({days}) overflow Integer");
+            };
+            let horizon = (i64::from(days) + 1) * 10;
+            require!(
+                i64::from(today.serial_number()) + horizon
+                    <= i64::from(Date::max_date().serial_number()),
+                "evaluation date ({today}) is too close to the maximum date to advance {days} settlement days"
+            );
+            let calendar = self
+                .calendar
+                .as_ref()
+                .expect("a moving term structure holds a calendar");
+            let advanced = calendar.advance(
+                today,
+                n,
+                TimeUnit::Days,
+                BusinessDayConvention::Following,
+                false,
+            );
+            self.reference.date.set(Some(advanced));
+        }
+        match self.reference.date.get() {
+            Some(date) if date != Date::null() => Ok(date),
+            _ => fail!("no reference date provided: construct with one or override reference_date"),
+        }
+    }
+
+    /// The day counter used for date/time conversion, when provided.
+    pub fn day_counter(&self) -> Option<DayCounter> {
+        self.day_counter.clone()
+    }
+
+    /// The calendar used for reference-date calculation, when provided.
+    pub fn calendar(&self) -> Option<Calendar> {
+        self.calendar.clone()
+    }
+
+    /// The settlement days used for reference-date calculation.
+    pub fn settlement_days(&self) -> QlResult<Natural> {
+        match self.settlement_days {
+            Some(days) => Ok(days),
+            None => fail!("settlement days not provided for this instance"),
+        }
+    }
+
+    /// The observable notifying the structure's observers.
+    pub fn observable(&self) -> &Observable {
+        &self.observable
+    }
+
+    /// The structure's observer half, for registering with further
+    /// observables (a quote handle, another curve); notifications received
+    /// through it behave like C++'s `TermStructure::update()`.
+    pub fn updater(&self) -> SharedMut<dyn Observer> {
+        self.updater.clone()
+    }
+
+    /// Whether the curve answers dates/times beyond its maximum.
+    pub fn allows_extrapolation(&self) -> bool {
+        self.extrapolation.get()
+    }
+
+    /// Allows extrapolation past the maximum date/time.
+    pub fn enable_extrapolation(&self) {
+        self.extrapolation.set(true);
+    }
+
+    /// Forbids extrapolation past the maximum date/time.
+    pub fn disable_extrapolation(&self) {
+        self.extrapolation.set(false);
+    }
+}
+
+/// Basic term-structure functionality.
+///
+/// Mirrors QuantLib's `TermStructure` interface; the provided methods
+/// delegate to the embedded [`TermStructureBase`] exactly as the C++ base
+/// class implements them, and a concrete curve overrides the ones it manages
+/// itself (typically [`reference_date`](Self::reference_date) when built via
+/// [`TermStructureBase::new`]).
+pub trait TermStructure: AsObservable {
+    /// The embedded shared holder.
+    fn base(&self) -> &TermStructureBase;
+
+    /// The structure's observer half, for registering with an upstream
+    /// observable or delivering a fan-out to. Defaults to the base half; a
+    /// curve whose cache lives behind a private updater (a bootstrapped curve)
+    /// overrides this to return that half instead, so a notification reaches
+    /// the state that re-solves the curve rather than only its subscribers.
+    fn updater(&self) -> SharedMut<dyn Observer> {
+        self.base().updater()
+    }
+
+    /// Registers `observer` with the structure's UPSTREAM observables (its data
+    /// inputs), not with the structure itself.
+    ///
+    /// The port of C++ `Observer::registerWithObservables(curve)`
+    /// (`observable.hpp:132-139`), which registers with the observables *of* the
+    /// curve and, verbatim, "does not include registering with the observer
+    /// itself". A subscriber wired this way hears an input change (a quote move,
+    /// a relink, an eval-date change) as a sibling of the curve's own updater,
+    /// and is never notified from inside the curve's updater mid-calculation.
+    /// The default is a no-op: a structure with no observed inputs has no
+    /// upstream.
+    fn register_upstream(&self, observer: &SharedMut<dyn Observer>) {
+        let _ = observer;
+    }
+
+    /// The latest date for which the curve can return values.
+    fn max_date(&self) -> Date;
+
+    /// The day counter used for date/time conversion, when provided.
+    fn day_counter(&self) -> Option<DayCounter> {
+        self.base().day_counter()
+    }
+
+    /// The day counter, or an error for structures built without one.
+    fn require_day_counter(&self) -> QlResult<DayCounter> {
+        let Some(day_counter) = self.day_counter() else {
+            fail!("no day counter provided for this term structure");
+        };
+        Ok(day_counter)
+    }
+
+    /// The calendar used for reference-date calculation, when provided.
+    fn calendar(&self) -> Option<Calendar> {
+        self.base().calendar()
+    }
+
+    /// The settlement days used for reference-date calculation.
+    fn settlement_days(&self) -> QlResult<Natural> {
+        self.base().settlement_days()
+    }
+
+    /// The date at which discount = 1.0 and/or variance = 0.0.
+    fn reference_date(&self) -> QlResult<Date> {
+        self.base().reference_date()
+    }
+
+    /// The period from the reference date to `date` as a year fraction.
+    fn time_from_reference(&self, date: Date) -> QlResult<Time> {
+        let day_counter = self.require_day_counter()?;
+        Ok(day_counter.year_fraction(self.reference_date()?, date))
+    }
+
+    /// The latest time for which the curve can return values.
+    fn max_time(&self) -> QlResult<Time> {
+        self.time_from_reference(self.max_date())
+    }
+
+    /// Whether the curve answers dates/times beyond its maximum.
+    fn allows_extrapolation(&self) -> bool {
+        self.base().allows_extrapolation()
+    }
+
+    /// Allows extrapolation past the maximum date/time.
+    fn enable_extrapolation(&self) {
+        self.base().enable_extrapolation()
+    }
+
+    /// Forbids extrapolation past the maximum date/time.
+    fn disable_extrapolation(&self) {
+        self.base().disable_extrapolation()
+    }
+
+    /// Date-range check: `date` must not precede the reference date nor,
+    /// unless extrapolation applies, exceed the maximum date.
+    fn check_range_date(&self, date: Date, extrapolate: bool) -> QlResult<()> {
+        let reference = self.reference_date()?;
+        require!(
+            date >= reference,
+            "date ({date}) before reference date ({reference})"
+        );
+        require!(
+            extrapolate || self.allows_extrapolation() || date <= self.max_date(),
+            "date ({date}) is past max curve date ({max})",
+            max = self.max_date()
+        );
+        Ok(())
+    }
+
+    /// Time-range check: `t` must be finite, non-negative and, unless
+    /// extrapolation applies, within the maximum time.
+    ///
+    /// The `t >= 0` requirement is QuantLib's `checkRange`
+    /// (`termstructure.cpp:66`). Divergence: the finiteness clause. `+inf`
+    /// passes `t >= 0` in C++, and an extrapolating curve never compares it
+    /// against `maxTime()`, so it reaches the interpolator unchecked.
+    fn check_range_time(&self, t: Time, extrapolate: bool) -> QlResult<()> {
+        if !t.is_finite() || t < 0.0 {
+            fail!("negative time ({t}) given");
+        }
+        if extrapolate || self.allows_extrapolation() {
+            return Ok(());
+        }
+        let max_time = self.max_time()?;
+        require!(
+            t <= max_time || close_enough(t, max_time),
+            "time ({t}) is past max curve time ({max_time})"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{Flag, as_observer};
+    use crate::time::calendars::target::Target;
+    use crate::time::date::Month;
+    use crate::time::daycounters::actual360::Actual360;
+
+    struct TestCurve {
+        base: TermStructureBase,
+        max: Date,
+    }
+
+    impl TestCurve {
+        fn fixed(reference_date: Date) -> TestCurve {
+            TestCurve {
+                base: TermStructureBase::with_reference_date(
+                    reference_date,
+                    None,
+                    Some(Actual360::new()),
+                ),
+                max: reference_date + 360,
+            }
+        }
+    }
+
+    impl AsObservable for TestCurve {
+        fn observable(&self) -> &Observable {
+            self.base.observable()
+        }
+    }
+
+    impl TermStructure for TestCurve {
+        fn base(&self) -> &TermStructureBase {
+            &self.base
+        }
+
+        fn max_date(&self) -> Date {
+            self.max
+        }
+    }
+
+    #[test]
+    fn fixed_reference_date_is_returned_verbatim() {
+        let reference = Date::new(15, Month::June, 2026);
+        let curve = TestCurve::fixed(reference);
+        assert_eq!(curve.reference_date().unwrap(), reference);
+        assert!(curve.settlement_days().is_err());
+        assert!(curve.calendar().is_none());
+    }
+
+    #[test]
+    fn time_from_reference_uses_the_day_counter() {
+        let reference = Date::new(15, Month::June, 2026);
+        let curve = TestCurve::fixed(reference);
+        let half_year = curve.time_from_reference(reference + 180).unwrap();
+        assert_eq!(half_year, 0.5);
+        assert_eq!(curve.max_time().unwrap(), 1.0);
+    }
+
+    #[test]
+    fn moving_reference_date_advances_off_the_evaluation_date() {
+        let settings = shared(Settings::new());
+        settings.set_evaluation_date(Date::new(15, Month::January, 2026));
+        let curve = TestCurve {
+            base: TermStructureBase::moving(
+                2,
+                Target::new(),
+                Some(Actual360::new()),
+                settings.clone(),
+            ),
+            max: Date::new(15, Month::January, 2027),
+        };
+        assert_eq!(
+            curve.reference_date().unwrap(),
+            Date::new(19, Month::January, 2026)
+        );
+        assert_eq!(curve.settlement_days().unwrap(), 2);
+    }
+
+    #[test]
+    fn evaluation_date_change_recomputes_reference_and_notifies() {
+        let settings = shared(Settings::new());
+        settings.set_evaluation_date(Date::new(15, Month::January, 2026));
+        let curve = TestCurve {
+            base: TermStructureBase::moving(
+                0,
+                Target::new(),
+                Some(Actual360::new()),
+                settings.clone(),
+            ),
+            max: Date::new(15, Month::January, 2027),
+        };
+        assert_eq!(
+            curve.reference_date().unwrap(),
+            Date::new(15, Month::January, 2026)
+        );
+
+        let flag = Flag::new();
+        curve.observable().register_observer(&as_observer(&flag));
+        settings.set_evaluation_date(Date::new(16, Month::January, 2026));
+
+        assert!(Flag::is_up(&flag));
+        assert_eq!(
+            curve.reference_date().unwrap(),
+            Date::new(16, Month::January, 2026)
+        );
+    }
+
+    #[test]
+    fn moving_without_evaluation_date_is_an_error() {
+        let settings = shared(Settings::new());
+        let base = TermStructureBase::moving(2, Target::new(), Some(Actual360::new()), settings);
+        let err = base.reference_date().unwrap_err();
+        assert!(err.message().contains("no evaluation date set"));
+    }
+
+    #[test]
+    fn null_or_near_max_evaluation_dates_are_errors_not_panics() {
+        let settings = shared(Settings::new());
+        let base =
+            TermStructureBase::moving(2, Target::new(), Some(Actual360::new()), settings.clone());
+
+        settings.set_evaluation_date(Date::null());
+        let err = base.reference_date().unwrap_err();
+        assert!(err.message().contains("null evaluation date"));
+
+        settings.set_evaluation_date(Date::max_date());
+        let err = base.reference_date().unwrap_err();
+        assert!(err.message().contains("too close to the maximum date"));
+    }
+
+    #[test]
+    fn extrapolation_short_circuits_before_max_time_is_computed() {
+        struct NoDayCounterCurve {
+            base: TermStructureBase,
+        }
+        impl AsObservable for NoDayCounterCurve {
+            fn observable(&self) -> &Observable {
+                self.base.observable()
+            }
+        }
+        impl TermStructure for NoDayCounterCurve {
+            fn base(&self) -> &TermStructureBase {
+                &self.base
+            }
+            fn max_date(&self) -> Date {
+                Date::max_date()
+            }
+        }
+
+        let curve = NoDayCounterCurve {
+            base: TermStructureBase::new(None),
+        };
+        assert!(curve.check_range_time(0.5, true).is_ok());
+        curve.enable_extrapolation();
+        assert!(curve.check_range_time(0.5, false).is_ok());
+        curve.disable_extrapolation();
+        assert!(curve.check_range_time(0.5, false).is_err());
+    }
+
+    #[test]
+    fn range_check_rejects_non_finite_time_even_with_extrapolation() {
+        let curve = TestCurve::fixed(Date::new(15, Month::June, 2026));
+        curve.enable_extrapolation();
+
+        assert!(curve.check_range_time(Time::INFINITY, false).is_err());
+        assert!(curve.check_range_time(Time::NEG_INFINITY, true).is_err());
+        assert!(curve.check_range_time(Time::NAN, true).is_err());
+    }
+
+    #[test]
+    fn detached_base_has_no_reference_date() {
+        let base = TermStructureBase::new(Some(Actual360::new()));
+        assert!(base.reference_date().is_err());
+        assert!(base.settlement_days().is_err());
+    }
+
+    #[test]
+    fn updater_forwards_notifications_without_touching_a_fixed_reference() {
+        let reference = Date::new(15, Month::June, 2026);
+        let curve = TestCurve::fixed(reference);
+        let flag = Flag::new();
+        curve.observable().register_observer(&as_observer(&flag));
+
+        let source = Observable::new();
+        source.register_observer(&curve.base().updater());
+        source.notify_observers();
+
+        assert!(Flag::is_up(&flag));
+        assert_eq!(curve.reference_date().unwrap(), reference);
+    }
+
+    #[test]
+    fn check_range_date_enforces_reference_and_max() {
+        let reference = Date::new(15, Month::June, 2026);
+        let curve = TestCurve::fixed(reference);
+
+        assert!(curve.check_range_date(reference, false).is_ok());
+        assert!(curve.check_range_date(curve.max_date(), false).is_ok());
+
+        let before = curve.check_range_date(reference - 1, false).unwrap_err();
+        assert!(before.message().contains("before reference date"));
+
+        let past = curve
+            .check_range_date(curve.max_date() + 1, false)
+            .unwrap_err();
+        assert!(past.message().contains("past max curve date"));
+
+        assert!(curve.check_range_date(curve.max_date() + 1, true).is_ok());
+        curve.enable_extrapolation();
+        assert!(curve.check_range_date(curve.max_date() + 1, false).is_ok());
+        curve.disable_extrapolation();
+        assert!(curve.check_range_date(curve.max_date() + 1, false).is_err());
+    }
+
+    #[test]
+    fn check_range_time_enforces_sign_and_max() {
+        let curve = TestCurve::fixed(Date::new(15, Month::June, 2026));
+
+        assert!(curve.check_range_time(0.0, false).is_ok());
+        assert!(curve.check_range_time(1.0, false).is_ok());
+
+        let negative = curve.check_range_time(-0.1, false).unwrap_err();
+        assert!(negative.message().contains("negative time"));
+        assert!(curve.check_range_time(Time::NAN, false).is_err());
+
+        let past = curve.check_range_time(1.5, false).unwrap_err();
+        assert!(past.message().contains("past max curve time"));
+
+        assert!(curve.check_range_time(1.5, true).is_ok());
+        curve.enable_extrapolation();
+        assert!(curve.check_range_time(1.5, false).is_ok());
+    }
+}
